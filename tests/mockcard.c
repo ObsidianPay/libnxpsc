@@ -1246,35 +1246,26 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
         }
 
         case 0x6F: {                    // GetFileIDs
-            if (mock->file_count == 0) {
-                // nothing has been created: the fixture the older tests expect
-                if (cap < 4) {
-                    return NXPSC_E_LENGTH;
+            uint8_t ids[MOCK_MAX_FILES] = {0x00, 0x01, 0x02};
+            size_t count = 3;           // nothing created: the older tests' fixture
+            if (mock->file_count > 0) {
+                count = mock->file_count;
+                for (size_t i = 0; i < count; i++) {
+                    ids[i] = mock->files[i].file_no;
                 }
-                rx[0] = 0x00;
-                rx[1] = 0x00;
-                rx[2] = 0x01;
-                rx[3] = 0x02;
-                *rx_len = 4;
-                return NXPSC_OK;
-            }
-
-            uint8_t ids[MOCK_MAX_FILES] = {0};
-            for (size_t i = 0; i < mock->file_count; i++) {
-                ids[i] = mock->files[i].file_no;
             }
             if (mock->secure_active) {
-                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, ids, mock->file_count,
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, ids, count,
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
                 return rc;
             }
-            if (cap < mock->file_count + 1) {
+            if (cap < count + 1) {
                 return NXPSC_E_LENGTH;
             }
             rx[0] = 0x00;
-            memcpy(rx + 1, ids, mock->file_count);
-            *rx_len = mock->file_count + 1;
+            memcpy(rx + 1, ids, count);
+            *rx_len = count + 1;
             return NXPSC_OK;
         }
 
@@ -1289,18 +1280,19 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                     return rc;
                 }
                 // the fixture: a standard data file, plain, rights 0xEE00, 32 bytes
-                if (cap < 8) {
+                static const uint8_t fixture[7] = {0x00, 0x00, 0xEE, 0x00, 0x20, 0x00, 0x00};
+                if (mock->secure_active) {
+                    int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, fixture, sizeof(fixture),
+                                               0x00, false, rx, cap, rx_len);
+                    mock_secure_advance(mock);
+                    return rc;
+                }
+                if (cap < sizeof(fixture) + 1) {
                     return NXPSC_E_LENGTH;
                 }
                 rx[0] = 0x00;
-                rx[1] = 0x00;
-                rx[2] = 0x00;
-                rx[3] = 0xEE;
-                rx[4] = 0x00;
-                rx[5] = 0x20;
-                rx[6] = 0x00;
-                rx[7] = 0x00;
-                *rx_len = 8;
+                memcpy(rx + 1, fixture, sizeof(fixture));
+                *rx_len = sizeof(fixture) + 1;
                 return NXPSC_OK;
             }
 
