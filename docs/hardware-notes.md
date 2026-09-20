@@ -291,6 +291,13 @@ file's own settings refusing it.
 `NotifyTransactionSuccess` answers `0x1C` on EV3. The command is not implemented
 there.
 
+A `ChangeKey` attempted from a session built on a different key, where the
+application's key settings put key changes behind the master key, is refused
+with `0xAE` (authentication error), not `0x9D` (permission denied). The status
+names the session rather than the access right: the card is saying the key you
+are authenticated with is not the one that may do this. `0x9D` is what a file
+operation gets when the access rights refuse it.
+
 ## The proximity check
 ^[Top](#top)
 
