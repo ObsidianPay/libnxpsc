@@ -259,6 +259,36 @@ static void mock_note_file(mock_card_t *mock, uint8_t cmd, const uint8_t *data, 
     }
 }
 
+static mock_app_t *mock_find_app(mock_card_t *mock, uint32_t aid) {
+    for (size_t i = 0; i < mock->app_count; i++) {
+        if (mock->apps[i].present && mock->apps[i].aid == aid) {
+            return &mock->apps[i];
+        }
+    }
+    return NULL;
+}
+
+// CreateApplication: AID (3) || KeySettings || NumKeys and key type, then the
+// optional key set block and ISO fields, which the mock does not need
+static void mock_note_app(mock_card_t *mock, const uint8_t *data, size_t len) {
+    if (len < 5 || mock->app_count >= MOCK_MAX_APPS) {
+        return;
+    }
+    uint32_t aid = mock_u24(data);
+    if (mock_find_app(mock, aid) != NULL) {
+        return;
+    }
+
+    mock_app_t *app = &mock->apps[mock->app_count++];
+    memset(app, 0, sizeof(*app));
+    app->present = true;
+    app->aid = aid;
+    app->key_settings = data[3];
+    app->num_keys = (uint8_t)(data[4] & 0x0F);
+    app->key_type = (data[4] & 0x80) ? NXPSC_KEY_AES128
+                  : (data[4] & 0x40) ? NXPSC_KEY_3K3DES : NXPSC_KEY_2K3DES;
+}
+
 // A record written during a transaction is pending until CommitTransaction
 // applies it, and AbortTransaction throws it away. The file is cyclic: once it
 // holds max_records, the oldest goes
@@ -1215,6 +1245,15 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             mock->auth_scheme = MOCK_AUTH_EV2;
             return auth_begin_ev2(mock, tx_len > 2, rx, cap, rx_len);
 
+        case 0xCA: {                    // CreateApplication
+            size_t len = 0;
+            if (mock_write_payload(mock, tx, tx_len, 0, &len) == false) {
+                len = tx_len - 1;       // the payload is in the clear
+            }
+            mock_note_app(mock, tx + 1, len);
+            return mock_ack(mock, tx[0], rx, cap, rx_len);
+        }
+
         case 0x5A:                      // SelectApplication
             if (tx_len >= 4) {
                 mock->selected_aid = (uint32_t)tx[1] | ((uint32_t)tx[2] << 8) |
@@ -1224,26 +1263,31 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             *rx_len = 1;
             return NXPSC_OK;
 
-        case 0x6A:                      // GetApplicationIDs
+        case 0x6A:                      // GetApplicationIDs, three bytes each
             if (cap < 7) {
                 return NXPSC_E_LENGTH;
             }
+            uint8_t aids[MOCK_MAX_APPS * 3] = {0};
+            size_t aids_len = 0;
+            for (size_t i = 0; i < mock->app_count; i++) {
+                aids[aids_len++] = (uint8_t)(mock->apps[i].aid & 0xFF);
+                aids[aids_len++] = (uint8_t)((mock->apps[i].aid >> 8) & 0xFF);
+                aids[aids_len++] = (uint8_t)((mock->apps[i].aid >> 16) & 0xFF);
+            }
+
             if (mock->secure_active && tx_len >= 9 &&
                     (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
-                uint8_t payload[6] = {0x01, 0x02, 0x03, 0x11, 0x22, 0x33};
-                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, aids, aids_len,
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
                 return rc;
             }
+            if (cap < aids_len + 1) {
+                return NXPSC_E_LENGTH;
+            }
             rx[0] = 0x00;
-            rx[1] = 0x01;
-            rx[2] = 0x02;
-            rx[3] = 0x03;
-            rx[4] = 0x11;
-            rx[5] = 0x22;
-            rx[6] = 0x33;
-            *rx_len = 7;
+            memcpy(rx + 1, aids, aids_len);
+            *rx_len = aids_len + 1;
             return NXPSC_OK;
 
         case 0x61:                      // GetISOFileIDs, two byte ids little endian
@@ -1262,24 +1306,62 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             mock->df_names_step = 0;
             return df_names_frame(mock, rx, cap, rx_len);
 
-        case 0x45:                      // GetKeySettings
-            if (cap < 3) {
+        case 0x45: {                    // GetKeySettings, of the selected application
+            const mock_app_t *app = mock_find_app(mock, mock->selected_aid);
+            if (app == NULL) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xA0, false,
+                                           rx, cap, rx_len);       // APPLICATION_NOT_FOUND
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            uint8_t payload[2];
+            payload[0] = app->key_settings;
+            payload[1] = (uint8_t)(app->num_keys
+                                   | ((app->key_type == NXPSC_KEY_AES128) ? 0x80
+                                      : (app->key_type == NXPSC_KEY_3K3DES) ? 0x40 : 0x00));
+            if (mock->secure_active
+                    && (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
+                                           0x00, false, rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            if (cap < sizeof(payload) + 1) {
                 return NXPSC_E_LENGTH;
             }
             rx[0] = 0x00;
-            rx[1] = 0x0F;                   // settings
-            rx[2] = 0x83;                   // 3 keys, AES
-            *rx_len = 3;
+            memcpy(rx + 1, payload, sizeof(payload));
+            *rx_len = sizeof(payload) + 1;
             return NXPSC_OK;
+        }
 
-        case 0x64:                      // GetKeyVersion
+        case 0x64: {                    // GetKeyVersion
+            const mock_app_t *app = mock_find_app(mock, mock->selected_aid);
+            uint8_t key_no = (tx_len > 1) ? (uint8_t)(tx[1] & 0x3F) : 0;
+            if (app == NULL || key_no >= app->num_keys) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0x40, false,
+                                           rx, cap, rx_len);       // NO_SUCH_KEY
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            uint8_t version = app->key_version[key_no];
+            if (mock->secure_active
+                    && (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, &version, 1, 0x00, false,
+                                           rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
             if (cap < 2) {
                 return NXPSC_E_LENGTH;
             }
             rx[0] = 0x00;
-            rx[1] = 0x42;
+            rx[1] = version;
             *rx_len = 2;
             return NXPSC_OK;
+        }
 
         case 0x3C:                      // Read_Sig
             if (cap < 57) {
@@ -1805,6 +1887,16 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             // key set 0 is the active one, so changing the session key there
             // ends the session. any other set leaves it alone
             ends_session = (tx[1] == 0x00) && ((tx[2] & 0x3F) == mock->secure_key_no);
+        }
+
+        // the new key's version rides inside the cryptogram, so the card takes
+        // the one the caller stated through mock_card_t::change_key_version
+        if (tx[0] == DF_CHANGE_KEY && tx_len >= 2) {
+            mock_app_t *app = mock_find_app(mock, mock->selected_aid);
+            uint8_t key_no = (uint8_t)(tx[1] & 0x3F);
+            if (app != NULL && key_no < app->num_keys) {
+                app->key_version[key_no] = mock->change_key_version;
+            }
         }
 
         // the legacy channel only MACs the answers to ReadData, ReadRecords and

@@ -1040,15 +1040,22 @@ static void test_info_parsing(void) {
 
     bool ok = (nxpsc_open(&transport, &card) == NXPSC_OK);
 
+    // the card answers about the application it holds, so create one first
+    ok = ok && (nxpsc_create_application(card, 0x010203, 0x0F, 3, NXPSC_KEY_AES128) == NXPSC_OK);
+    ok = ok && (nxpsc_select_application(card, 0x010203) == NXPSC_OK);
+
     uint8_t settings = 0;
     uint8_t num_keys = 0;
     nxpsc_keytype_t ktype = NXPSC_KEY_DES;
     ok = ok && (nxpsc_get_key_settings(card, &settings, &num_keys, &ktype) == NXPSC_OK);
     ok = ok && (settings == 0x0F) && (num_keys == 3) && (ktype == NXPSC_KEY_AES128);
 
-    uint8_t version = 0;
+    // every key starts at the factory version, and a key the application does
+    // not have is an error rather than a number
+    uint8_t version = 0xFF;
     ok = ok && (nxpsc_get_key_version(card, 1, &version) == NXPSC_OK);
-    ok = ok && (version == 0x42);
+    ok = ok && (version == 0x00);
+    ok = ok && (nxpsc_get_key_version(card, 5, &version) != NXPSC_OK);
 
     uint32_t freemem = 0;
     ok = ok && (nxpsc_get_free_memory(card, &freemem) == NXPSC_OK);
@@ -1058,7 +1065,7 @@ static void test_info_parsing(void) {
     ok = ok && (nxpsc_get_signature(card, sig, sizeof(sig), &siglen) == NXPSC_OK);
     ok = ok && (siglen == 56) && (sig[0] == 0xA0) && (sig[55] == 0xD7);
 
-    // the mock reports the files it holds, so give it some to report
+    // and about the files it holds, so give it some of those too
     nxpsc_access_t any = {0, 0, 0, 0};
     ok = ok && (nxpsc_create_std_file(card, 0x00, 0, NXPSC_COMM_PLAIN, &any, 32) == NXPSC_OK);
     ok = ok && (nxpsc_create_std_file(card, 0x01, 0, NXPSC_COMM_PLAIN, &any, 32) == NXPSC_OK);
@@ -1383,6 +1390,106 @@ static void test_commit_reader_id(void) {
     }
 
     check("CommitReaderID carries the reader id and returns the previous one", ok);
+    nxpsc_close(card);
+}
+
+// One round trip per command the mock answers from state: write something,
+// read it back, and get what was written. A fixed table cannot creep back in
+// without one of these failing.
+static void test_mock_answers_what_was_written(void) {
+    static const uint8_t record_a[8] = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7};
+    static const uint8_t record_b[8] = {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7};
+    static const uint8_t data[12] = {
+        0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB
+    };
+
+    mock_card_t mock;
+    nxpsc_transport_t transport;
+    nxpsc_card_t *card = NULL;
+
+    mock_init(&mock, DESFIRE_EV2);
+    mock_transport(&mock, &transport);
+
+    nxpsc_access_t access = {0x0E, 0x0E, 0x0E, 0x00};
+    bool ok = (nxpsc_open(&transport, &card) == NXPSC_OK);
+
+    // CreateApplication -> GetApplicationIDs, GetKeySettings, GetKeyVersion
+    ok = ok && (nxpsc_create_application(card, 0xF0B501, 0x0B, 6, NXPSC_KEY_AES128) == NXPSC_OK);
+    uint32_t aids[MOCK_MAX_APPS] = {0};
+    size_t count = 0;
+    ok = ok && (nxpsc_get_application_ids(card, aids, MOCK_MAX_APPS, &count) == NXPSC_OK);
+    ok = ok && (count == 1) && (aids[0] == 0xF0B501);
+
+    ok = ok && (nxpsc_select_application(card, 0xF0B501) == NXPSC_OK);
+    uint8_t settings = 0;
+    uint8_t num_keys = 0;
+    nxpsc_keytype_t key_type = NXPSC_KEY_DES;
+    ok = ok && (nxpsc_get_key_settings(card, &settings, &num_keys, &key_type) == NXPSC_OK);
+    ok = ok && (settings == 0x0B) && (num_keys == 6) && (key_type == NXPSC_KEY_AES128);
+
+    uint8_t version = 0xFF;
+    ok = ok && (nxpsc_get_key_version(card, 0, &version) == NXPSC_OK);
+    ok = ok && (version == 0x00);
+
+    // CreateFile -> GetFileIDs, GetFileSettings
+    ok = ok && (nxpsc_create_record_file(card, true, 0x01, 0, NXPSC_COMM_PLAIN, &access, 8, 3)
+                == NXPSC_OK);
+    ok = ok && (nxpsc_create_std_file(card, 0x02, 0, NXPSC_COMM_PLAIN, &access, 32) == NXPSC_OK);
+    ok = ok && (nxpsc_create_value_file(card, 0x03, NXPSC_COMM_PLAIN, &access, 0, 500, 250, false)
+                == NXPSC_OK);
+
+    uint8_t ids[NXPSC_MAX_FILES] = {0};
+    count = 0;
+    ok = ok && (nxpsc_get_file_ids(card, ids, sizeof(ids), &count) == NXPSC_OK);
+    ok = ok && (count == 3) && (ids[0] == 0x01) && (ids[2] == 0x03);
+
+    nxpsc_file_settings_t file;
+    memset(&file, 0, sizeof(file));
+    ok = ok && (nxpsc_get_file_settings(card, 0x01, &file) == NXPSC_OK);
+    ok = ok && (file.record_size == 8) && (file.max_records == 3);
+
+    // WriteData -> ReadData
+    uint8_t back[64] = {0};
+    size_t back_len = 0;
+    ok = ok && (nxpsc_write_data(card, 0x02, 4, data, sizeof(data), NXPSC_COMM_PLAIN) == NXPSC_OK);
+    ok = ok && (nxpsc_read_data(card, 0x02, 4, sizeof(data), NXPSC_COMM_PLAIN, back, sizeof(back),
+                                &back_len) == NXPSC_OK);
+    ok = ok && (back_len == sizeof(data)) && (memcmp(back, data, sizeof(data)) == 0);
+
+    // WriteRecord -> ReadRecords, newest first, and only once committed
+    ok = ok && (nxpsc_write_record(card, 0x01, 0, record_a, sizeof(record_a), NXPSC_COMM_PLAIN)
+                == NXPSC_OK);
+    ok = ok && (nxpsc_commit_transaction(card) == NXPSC_OK);
+    ok = ok && (nxpsc_write_record(card, 0x01, 0, record_b, sizeof(record_b), NXPSC_COMM_PLAIN)
+                == NXPSC_OK);
+    ok = ok && (nxpsc_commit_transaction(card) == NXPSC_OK);
+
+    back_len = 0;
+    ok = ok && (nxpsc_read_records(card, 0x01, 0, 2, NXPSC_COMM_PLAIN, back, sizeof(back), &back_len)
+                == NXPSC_OK);
+    ok = ok && (back_len == 16);
+    ok = ok && (memcmp(back, record_b, sizeof(record_b)) == 0);
+    ok = ok && (memcmp(back + 8, record_a, sizeof(record_a)) == 0);
+
+    // Credit and Debit -> GetValue, again only once committed
+    int32_t value = 0;
+    ok = ok && (nxpsc_get_value(card, 0x03, NXPSC_COMM_PLAIN, &value) == NXPSC_OK);
+    ok = ok && (value == 250);
+    ok = ok && (nxpsc_debit(card, 0x03, 50, NXPSC_COMM_PLAIN) == NXPSC_OK);
+    ok = ok && (nxpsc_commit_transaction(card) == NXPSC_OK);
+    ok = ok && (nxpsc_get_value(card, 0x03, NXPSC_COMM_PLAIN, &value) == NXPSC_OK);
+    ok = ok && (value == 200);
+
+    // DeleteFile -> GetFileIDs, GetFileSettings
+    ok = ok && (nxpsc_delete_file(card, 0x02) == NXPSC_OK);
+    count = 0;
+    ok = ok && (nxpsc_get_file_ids(card, ids, sizeof(ids), &count) == NXPSC_OK);
+    ok = ok && (count == 2);
+    ok = ok && (nxpsc_get_file_settings(card, 0x02, &file) != NXPSC_OK);
+    ok = ok && (nxpsc_read_data(card, 0x02, 0, 4, NXPSC_COMM_PLAIN, back, sizeof(back), &back_len)
+                != NXPSC_OK);
+
+    check("the mock answers what was written to it", ok);
     nxpsc_close(card);
 }
 
@@ -1982,6 +2089,8 @@ static void test_session_abort_on_card_error(void) {
         // authenticating again restores service
         ok = ok && (nxpsc_authenticate(card, 0, &key, NXPSC_CHAN_EV2) == NXPSC_OK);
         ok = ok && (nxpsc_session_lost(card) == false);
+        ok = ok && (nxpsc_create_application(card, 0x030201, 0x0F, 1, NXPSC_KEY_AES128) == NXPSC_OK);
+        ok = ok && (nxpsc_create_application(card, 0x332211, 0x0F, 1, NXPSC_KEY_AES128) == NXPSC_OK);
         ok = ok && (nxpsc_get_application_ids(card, aids, 2, &count) == NXPSC_OK);
         ok = ok && (count == 2);
         ok = ok && (aids[0] == 0x030201) && (aids[1] == 0x332211);
@@ -2203,6 +2312,7 @@ int main(void) {
     test_iso7816_wrappers();
     test_commit_reader_id();
     test_created_files_are_reported();
+    test_mock_answers_what_was_written();
     test_transaction_mac();
     test_diversification_wrapper();
     test_reporting_helpers();
