@@ -57,6 +57,17 @@ described was then confirmed against a card before anything was written.
   and bit 2 to specific capability data in `createApplication`, and swaps the two
   in `createDelegatedApplicationParam`. Only one can be right; this library
   follows `createApplication`, which is the path that was exercised on hardware.
+- **Transaction MAC: nothing to cross reference against.** proxmark3 builds the
+  same SV1 for the transaction MAC session key (`DesfireGenTransSessionKeyEV2`,
+  citing MF2DLHX0 page 42), and this library agrees with it byte for byte. That
+  is where the agreement ends: proxmark3 never accumulates a TMI and never
+  computes a TMV, it only prints the TMC and TMV the card returned. libfreefare,
+  python-desfire and DESFireAES predate the feature. So the TMI layouts in
+  `nxpsc_tmac_tmi_write_record` come from the MF2DL(H)x0 data sheet rev 3.3
+  section 10.3.4.2 alone, with no second implementation to check them against.
+  The mock card's side (`tests/mockcard.c`) is written separately from the same
+  section for exactly that reason: a test where both sides came from one
+  function would only prove the function agrees with itself.
 - **Where all four originals are silent.** None of proxmark3, libfreefare,
   python-desfire or DESFireAES implements the key set commands, and only
   SpringCard and liblogicalaccess implement the proximity check. Both areas were
@@ -79,6 +90,14 @@ card manual" in the header.
 
 - The AES256 path of AN10922 has no published test vector. The construction
   follows the note, but is not covered by a known answer test.
+- **The transaction MAC has no published test vectors at all.** NXP publishes
+  the construction but no worked example, and none of the references carries
+  one. `nxpsc_tmac_compute` is therefore checked only against the mock card's
+  independent implementation, which shares its reading of the data sheet but not
+  its code. A real card is the only witness that settles it, so any caller that
+  depends on the TMV should prove it per card against the silicon rather than
+  trusting these tests. `tmi` layouts for commands other than `WriteRecord` are
+  not implemented; add them from section 10.3.4.2 as they are needed.
 - `nxpsc_session_key_lrp()` ignores its encryption key argument, which matches
   the proxmark3 behaviour and the note, but is worth re-reading if LRP ever
   misbehaves on hardware.

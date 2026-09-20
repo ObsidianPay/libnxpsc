@@ -185,9 +185,12 @@ most recent one, where `nxpsc_write_record()` appends a new one.
 ### Work with the transaction MAC
 
 Transaction MAC files let a terminal prove a transaction happened. Create one
-with `nxpsc_create_transaction_mac_file()`, then call `nxpsc_commit_reader_id()`
-inside the transaction. The transaction MAC session keys are derived by the
-library. See [EV2 and later extras](advanced.md#transaction-mac-files).
+with `nxpsc_create_transaction_mac_file()`, then finish the transaction with
+`nxpsc_commit_transaction_tmac()` to get back the counter and the MAC the card
+computed. `nxpsc_commit_reader_id()` additionally binds a reader identity into
+it. A back office checks the MAC with `nxpsc_tmac_compute()`, which needs no
+card. The transaction MAC session keys are derived by the library. See
+[EV2 and later extras](advanced.md#transaction-mac-files).
 
 ### Switch DESFire Light to LRP mode
 

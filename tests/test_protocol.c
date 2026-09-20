@@ -1307,6 +1307,125 @@ static void test_commit_reader_id(void) {
     nxpsc_close(card);
 }
 
+// The transaction MAC: the card computes a TMV over what it saw, the back
+// office recomputes it from what it expected. There are no published vectors
+// for this, so what is checked here is that two independent readings of the
+// data sheet agree: the mock builds the TMI and the TMV its own way (see
+// mockcard.c) and nxpsc_tmac_compute builds them from the library's side.
+// Only a real card settles it, which is why the personaliser proves it per card.
+static void test_transaction_mac(void) {
+    static const uint8_t session_enc[16] = {
+        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+        0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F
+    };
+    static const uint8_t session_mac[16] = {
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+        0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F
+    };
+    static const uint8_t iv[16] = {0};
+    static const uint8_t ti[4] = {0xCA, 0xFE, 0xBA, 0xBE};
+    static const uint8_t tm_key_data[16] = {
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF
+    };
+    static const uint8_t record[32] = {
+        0x01, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+        0x1F, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    };
+
+    mock_card_t mock;
+    nxpsc_card_t *card = NULL;
+    bool ok = setup_secure_session(&mock, &card, DESFIRE_EV3, NXPSC_CHAN_EV2,
+                                   NXPSC_KEY_AES128, session_enc, session_mac, iv, ti, 0);
+
+    nxpsc_key_t tm_key = {0};
+    tm_key.type = NXPSC_KEY_AES128;
+    memcpy(tm_key.data, tm_key_data, sizeof(tm_key_data));
+    // a real card is told the key inside CreateTransactionMACFile, enciphered
+    memcpy(mock.tm_key, tm_key_data, sizeof(tm_key_data));
+
+    if (ok) {
+        nxpsc_access_t access = {2, 0x0F, 2, 0x0F};
+        ok = ok && (nxpsc_create_transaction_mac_file(card, 0x02, NXPSC_COMM_MAC, &access,
+                                                      &tm_key, 1) == NXPSC_OK);
+        ok = ok && mock.tm_file;
+
+        // one payment: a record written in MAC mode, then the commit
+        ok = ok && (nxpsc_write_record(card, 0x01, 0, record, sizeof(record), NXPSC_COMM_MAC)
+                    == NXPSC_OK);
+
+        uint8_t tmc[4] = {0};
+        uint8_t tmv[8] = {0};
+        ok = ok && (nxpsc_commit_transaction_tmac(card, tmc, tmv) == NXPSC_OK);
+        // the first transaction on a fresh file reports counter 1, LSB first
+        ok = ok && (tmc[0] == 0x01) && (tmc[1] == 0x00) && (tmc[2] == 0x00) && (tmc[3] == 0x00);
+
+        // rebuild the input from the record alone and recompute the value
+        uint8_t tmi[64] = {0};
+        size_t tmi_len = 0;
+        ok = ok && (nxpsc_tmac_tmi_write_record(0x01, 0, record, sizeof(record),
+                                                tmi, sizeof(tmi), &tmi_len) == NXPSC_OK);
+        ok = ok && (tmi_len == 16 + 32);
+        ok = ok && (tmi[0] == 0x3B) && (tmi[1] == 0x01);
+        ok = ok && (tmi[5] == 0x20) && (tmi[6] == 0x00) && (tmi[7] == 0x00);   // length, LSB first
+        ok = ok && (tmi[8] == 0x00) && (tmi[15] == 0x00);                      // the zero padding
+        ok = ok && (memcmp(tmi + 16, record, sizeof(record)) == 0);
+
+        uint8_t expected[8] = {0};
+        ok = ok && (nxpsc_tmac_compute(&tm_key, mock.uid, sizeof(mock.uid), tmc,
+                                       tmi, tmi_len, expected) == NXPSC_OK);
+        ok = ok && (memcmp(expected, tmv, sizeof(expected)) == 0);
+
+        // a second, identical transaction: the counter moves, so the value does
+        uint8_t tmc2[4] = {0};
+        uint8_t tmv2[8] = {0};
+        ok = ok && (nxpsc_write_record(card, 0x01, 0, record, sizeof(record), NXPSC_COMM_MAC)
+                    == NXPSC_OK);
+        ok = ok && (nxpsc_commit_transaction_tmac(card, tmc2, tmv2) == NXPSC_OK);
+        ok = ok && (tmc2[0] == 0x02);
+        ok = ok && (memcmp(tmv2, tmv, sizeof(tmv)) != 0);
+
+        uint8_t expected2[8] = {0};
+        ok = ok && (nxpsc_tmac_compute(&tm_key, mock.uid, sizeof(mock.uid), tmc2,
+                                       tmi, tmi_len, expected2) == NXPSC_OK);
+        ok = ok && (memcmp(expected2, tmv2, sizeof(expected2)) == 0);
+
+        // a wrong key, a wrong counter or a wrong record all miss
+        uint8_t other[8] = {0};
+        nxpsc_key_t wrong = tm_key;
+        wrong.data[0] ^= 0xFF;
+        ok = ok && (nxpsc_tmac_compute(&wrong, mock.uid, sizeof(mock.uid), tmc2,
+                                       tmi, tmi_len, other) == NXPSC_OK);
+        ok = ok && (memcmp(other, tmv2, sizeof(other)) != 0);
+        ok = ok && (nxpsc_tmac_compute(&tm_key, mock.uid, sizeof(mock.uid), tmc,
+                                       tmi, tmi_len, other) == NXPSC_OK);
+        ok = ok && (memcmp(other, tmv2, sizeof(other)) != 0);
+
+        uint8_t tampered[64] = {0};
+        memcpy(tampered, tmi, tmi_len);
+        tampered[20] ^= 0x01;
+        ok = ok && (nxpsc_tmac_compute(&tm_key, mock.uid, sizeof(mock.uid), tmc2,
+                                       tampered, tmi_len, other) == NXPSC_OK);
+        ok = ok && (memcmp(other, tmv2, sizeof(other)) != 0);
+
+        // arguments: 7 byte UID, whole blocks of input, AES-128 key, no nulls
+        ok = ok && (nxpsc_tmac_compute(&tm_key, mock.uid, 4, tmc, tmi, tmi_len, other)
+                    == NXPSC_E_LENGTH);
+        ok = ok && (nxpsc_tmac_compute(&tm_key, mock.uid, sizeof(mock.uid), tmc, tmi, 8, other)
+                    == NXPSC_E_LENGTH);
+        ok = ok && (nxpsc_tmac_compute(NULL, mock.uid, sizeof(mock.uid), tmc, tmi, tmi_len, other)
+                    == NXPSC_E_PARAM);
+        ok = ok && (nxpsc_tmac_tmi_write_record(0x01, 0, record, sizeof(record),
+                                                tmi, 16, &tmi_len) == NXPSC_E_LENGTH);
+        ok = ok && (nxpsc_commit_transaction_tmac(card, NULL, tmv) == NXPSC_E_PARAM);
+    }
+
+    check("transaction MAC: card and host agree on TMC and TMV", ok);
+    nxpsc_close(card);
+}
+
 // the derivation itself has known answer vectors in the self test. this is the
 // public wrapper over it, which is what callers actually reach for
 static void test_diversification_wrapper(void) {
@@ -1958,6 +2077,7 @@ int main(void) {
     test_data_access_framing();
     test_iso7816_wrappers();
     test_commit_reader_id();
+    test_transaction_mac();
     test_diversification_wrapper();
     test_reporting_helpers();
     test_ev1_handshake_chains_iv();

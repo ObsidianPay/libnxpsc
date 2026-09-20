@@ -56,6 +56,42 @@ needs an open session. During the transaction, `nxpsc_commit_reader_id()` binds
 the terminal identity into the MAC and returns the previous reader id,
 enciphered.
 
+Committing a transaction can hand back the MAC the card computed:
+
+```c
+uint8_t tmc[4], tmv[8];
+nxpsc_commit_transaction_tmac(card, tmc, tmv);   // CommitTransaction, option 0x01
+```
+
+`tmc` is the transaction counter (4 bytes, LSB first) and `tmv` the 8 byte
+transaction MAC value. Plain `nxpsc_commit_transaction()` commits without asking
+for either. The card rejects the option if the application has no transaction
+MAC file.
+
+The back office verifies the MAC without a card. It rebuilds the transaction MAC
+input from the data it expected the terminal to write, and recomputes the value
+with the same key the file was created with:
+
+```c
+uint8_t tmi[64], expected[8];
+size_t tmi_len = 0;
+nxpsc_tmac_tmi_write_record(file_no, 0, record, record_len, tmi, sizeof(tmi), &tmi_len);
+nxpsc_tmac_compute(&tm_key, uid, 7, tmc, tmi, tmi_len, expected);
+// compare expected with the card's tmv in constant time
+```
+
+`nxpsc_tmac_compute()` derives the session key from the TM key, the UID and the
+counter the card reported, then MACs the input; neither function touches a card.
+The counter is passed through exactly as the card reported it. A terminal that
+never holds the TM key cannot forge a value, and a value cannot be replayed
+because the counter only moves forward.
+
+There are **no published test vectors** for this construction, and no other
+implementation computes it to compare against. What the tests prove is that two
+independent readings of the data sheet agree, see
+[Porting notes](md/Development/Porting_Notes.md). Prove it against a real card
+before relying on it.
+
 ## Delegated applications
 ^[Top](#top)
 

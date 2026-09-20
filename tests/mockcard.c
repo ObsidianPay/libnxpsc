@@ -150,6 +150,65 @@ static void mock_secure_advance(mock_card_t *mock) {
     }
 }
 
+//-----------------------------------------------------------------------------
+// transaction MAC, the card's side
+//
+// Written from the MF2DL(H)x0 data sheet rev 3.3 section 10.3 on its own, so
+// that a test comparing it with nxpsc_tmac_compute compares two readings of the
+// data sheet rather than one function with itself. Only the AES-CMAC primitive
+// is shared, and that has its own known answer vectors in test_crypto.
+//-----------------------------------------------------------------------------
+
+// TMI || Cmd || FileNo || Offset || Length || ZeroPadding || Data, the whole
+// thing kept on a 16 byte boundary (10.3.4.2, WriteRecord)
+static void mock_tmi_write_record(mock_card_t *mock, const uint8_t *header,
+                                  const uint8_t *data, size_t data_len) {
+    size_t block = 16 + (data_len + 15) / 16 * 16;
+    if (mock->tmi_len + block > sizeof(mock->tmi)) {
+        return;
+    }
+
+    uint8_t *at = mock->tmi + mock->tmi_len;
+    memset(at, 0, block);
+    at[0] = DF_WRITE_RECORD;
+    memcpy(at + 1, header, 7);          // FileNo || Offset (3) || Length (3)
+    memcpy(at + 16, data, data_len);    // the eight bytes before it stay zero
+    mock->tmi_len += block;
+}
+
+// SesTMMACKey = CMAC(AppTransactionMACKey, 5Ah||00h||01h||00h||80h||(TMC+1)||UID)
+// TMV = the odd bytes of CMAC(SesTMMACKey, TMI)                    (10.3.2.3-4)
+static int mock_tmac_value(const mock_card_t *mock, uint32_t tmc, uint8_t tmv[8]) {
+    uint8_t sv1[16] = {0};
+    sv1[0] = 0x5A;
+    sv1[1] = 0x00;
+    sv1[2] = 0x01;
+    sv1[3] = 0x00;
+    sv1[4] = 0x80;
+    sv1[5] = (uint8_t)(tmc & 0xFF);             // TMC is LSB first
+    sv1[6] = (uint8_t)((tmc >> 8) & 0xFF);
+    sv1[7] = (uint8_t)((tmc >> 16) & 0xFF);
+    sv1[8] = (uint8_t)((tmc >> 24) & 0xFF);
+    memcpy(sv1 + 9, mock->uid, 7);
+
+    uint8_t session[16] = {0};
+    if (nxpsc_cmac(NXPSC_KEY_AES128, mock->tm_key, NULL, sv1, sizeof(sv1), 0, session)
+            != NXPSC_OK) {
+        return NXPSC_E_CRYPTO;
+    }
+
+    uint8_t full[16] = {0};
+    if (nxpsc_cmac(NXPSC_KEY_AES128, session, NULL, mock->tmi, mock->tmi_len, 0, full)
+            != NXPSC_OK) {
+        return NXPSC_E_CRYPTO;
+    }
+
+    for (int i = 0; i < 8; i++) {
+        tmv[i] = full[i * 2 + 1];
+    }
+    return NXPSC_OK;
+}
+
 static int mock_secure_reply(mock_card_t *mock, uint8_t cmd, nxpsc_commmode_t comm,
                              const uint8_t *payload, size_t payload_len, uint8_t status,
                              bool d40_ev1_style, uint8_t *rx, size_t cap, size_t *rx_len) {
@@ -1204,6 +1263,90 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                 rx[1] ^= 0xFF;
             }
             *rx_len = 9;
+            return NXPSC_OK;
+        }
+
+        case DF_CREATE_TRANS_MAC_FILE: {    // the key inside is enciphered, see mockcard.h
+            mock->tm_file = true;
+            mock->tmc = 0;
+            mock->tmi_len = 0;
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
+                                           rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            rx[0] = 0x00;
+            *rx_len = 1;
+            return NXPSC_OK;
+        }
+
+        case DF_WRITE_RECORD: {
+            // FileNo || Offset (3) || Length (3) || Data, and in MAC mode a
+            // trailing 8 byte command MAC the card strips before the TMI
+            size_t len = tx_len - 1;
+            if (mock->secure_active && len >= 8) {
+                len -= 8;
+            }
+            if (mock->tm_file && len > 7) {
+                mock_tmi_write_record(mock, tx + 1, tx + 8, len - 7);
+            }
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
+                                           rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            rx[0] = 0x00;
+            *rx_len = 1;
+            return NXPSC_OK;
+        }
+
+        case DF_COMMIT_TRANSACTION: {
+            // with option 0x01 the card answers TMC || TMV, and only an
+            // application holding a transaction MAC file can
+            size_t len = tx_len - 1;
+            if (mock->secure_active && len >= 8) {
+                len -= 8;
+            }
+            bool wants_tmac = (len >= 1) && (tx[1] == 0x01);
+            if (wants_tmac == false) {
+                break;                  // plain CommitTransaction, bare ack below
+            }
+            if (mock->tm_file == false || mock->tmi_len == 0) {
+                // the data sheet says only that the command is rejected; the
+                // status here is the mock's choice, not a card observation
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0x9D, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            uint32_t tmc = mock->tmc + 1;   // the counter used for the session key
+            uint8_t payload[12] = {0};
+            payload[0] = (uint8_t)(tmc & 0xFF);
+            payload[1] = (uint8_t)((tmc >> 8) & 0xFF);
+            payload[2] = (uint8_t)((tmc >> 16) & 0xFF);
+            payload[3] = (uint8_t)((tmc >> 24) & 0xFF);
+            if (mock_tmac_value(mock, tmc, payload + 4) != NXPSC_OK) {
+                return NXPSC_E_CRYPTO;
+            }
+
+            mock->tmc = tmc;
+            mock->tmi_len = 0;          // a new transaction starts here
+
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
+                                           0x00, false, rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            if (cap < sizeof(payload) + 1) {
+                return NXPSC_E_LENGTH;
+            }
+            rx[0] = 0x00;
+            memcpy(rx + 1, payload, sizeof(payload));
+            *rx_len = sizeof(payload) + 1;
             return NXPSC_OK;
         }
 

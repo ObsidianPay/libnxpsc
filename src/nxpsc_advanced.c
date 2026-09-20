@@ -108,6 +108,106 @@ int nxpsc_create_transaction_mac_file(nxpsc_card_t *card, uint8_t file_no,
 }
 
 //-----------------------------------------------------------------------------
+// transaction MAC, host side
+//
+// The card computes a Transaction MAC Value over a Transaction MAC Input it
+// accumulates during the transaction, under a session key derived from the
+// AppTransactionMACKey and the transaction counter. A back office holding the
+// same key recomputes both from data it already has, which is what these two
+// functions are for: neither touches a card.
+//
+// MF2DL(H)x0 data sheet rev 3.3 section 10.3 ("Transaction MAC"):
+//   SV1          = 5Ah || 00h || 01h || 00h || 80h || (TMC+1) || UID
+//   SesTMMACKey  = PRF(AppTransactionMACKey, SV1)      PRF = CMAC, NIST SP 800-108
+//   TMV          = MACtTM(SesTMMACKey, TMI)            truncated CMAC, zero IV
+// TMC is 4 bytes LSB first. CommitTransaction reports the already incremented
+// counter, i.e. exactly the value that went into SV1, so the caller passes the
+// reported TMC through unchanged.
+//
+// proxmark3's DesfireGenTransSessionKeyEV2 builds the same SV1; it has no TMI
+// accumulation or TMV computation to compare against. See
+// docs/md/Development/Porting_Notes.md.
+//-----------------------------------------------------------------------------
+int nxpsc_tmac_compute(const nxpsc_key_t *tm_key, const uint8_t *uid, size_t uid_len,
+                       const uint8_t tmc[4], const uint8_t *tmi, size_t tmi_len,
+                       uint8_t tmv[8]) {
+    if (tm_key == NULL || uid == NULL || tmc == NULL || tmi == NULL || tmv == NULL) {
+        return NXPSC_E_PARAM;
+    }
+    if (tm_key->type != NXPSC_KEY_AES128) {
+        return NXPSC_E_UNSUPPORTED;
+    }
+    // the 11 byte context of SV1 is the 4 byte counter and a 7 byte UID
+    if (uid_len != 7) {
+        return NXPSC_E_LENGTH;
+    }
+    // every TMI update ends on a 16 byte boundary, so a TMI that does not is a
+    // caller error rather than something a card would ever have accumulated
+    if (tmi_len == 0 || (tmi_len % 16) != 0) {
+        return NXPSC_E_LENGTH;
+    }
+
+    uint8_t sv1[16] = { 0x5A, 0x00, 0x01, 0x00, 0x80 };
+    memcpy(sv1 + 5, tmc, 4);
+    memcpy(sv1 + 9, uid, 7);
+
+    uint8_t session_key[16] = {0};
+    int status = nxpsc_cmac(NXPSC_KEY_AES128, tm_key->data, NULL, sv1, sizeof(sv1), 0, session_key);
+    if (status != NXPSC_OK) {
+        nxpsc_secure_zero(session_key, sizeof(session_key));
+        return status;
+    }
+
+    uint8_t full[16] = {0};
+    status = nxpsc_cmac(NXPSC_KEY_AES128, session_key, NULL, tmi, tmi_len, 0, full);
+    if (status == NXPSC_OK) {
+        nxpsc_truncate_mac(full, tmv);
+    }
+
+    nxpsc_secure_zero(session_key, sizeof(session_key));
+    nxpsc_secure_zero(full, sizeof(full));
+    return status;
+}
+
+// Data sheet section 10.3.4.2, WriteRecord:
+//   TMI = TMI || Cmd || FileNo || Offset || Length || ZeroPadding || Data
+// The eight zero bytes bring the command parameters up to 16; record data is
+// itself a multiple of 16, so nothing is appended after it. Offset and Length
+// are 3 bytes LSB first, exactly as they appear on the command interface, and
+// the data is the plain record regardless of the communication mode used.
+int nxpsc_tmac_tmi_write_record(uint8_t file_no, uint32_t offset,
+                                const uint8_t *data, size_t data_len,
+                                uint8_t *tmi, size_t cap, size_t *tmi_len) {
+    if (data == NULL || tmi == NULL || tmi_len == NULL) {
+        return NXPSC_E_PARAM;
+    }
+    if (offset > 0xFFFFFF || data_len == 0 || data_len > 0xFFFFFF) {
+        return NXPSC_E_PARAM;
+    }
+
+    size_t padded = (data_len + 15) / 16 * 16;
+    size_t needed = 16 + padded;
+    if (cap < needed) {
+        return NXPSC_E_LENGTH;
+    }
+
+    memset(tmi, 0, needed);
+    tmi[0] = DF_WRITE_RECORD;
+    tmi[1] = file_no;
+    tmi[2] = (uint8_t)(offset & 0xFF);
+    tmi[3] = (uint8_t)((offset >> 8) & 0xFF);
+    tmi[4] = (uint8_t)((offset >> 16) & 0xFF);
+    tmi[5] = (uint8_t)(data_len & 0xFF);
+    tmi[6] = (uint8_t)((data_len >> 8) & 0xFF);
+    tmi[7] = (uint8_t)((data_len >> 16) & 0xFF);
+    // tmi[8..15] stay zero: the ZeroPadding of the command parameters
+    memcpy(tmi + 16, data, data_len);
+
+    *tmi_len = needed;
+    return NXPSC_OK;
+}
+
+//-----------------------------------------------------------------------------
 // delegated application management
 //-----------------------------------------------------------------------------
 int nxpsc_create_delegated_application(nxpsc_card_t *card, uint32_t aid, uint16_t dam_slot,

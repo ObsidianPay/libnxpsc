@@ -383,6 +383,11 @@ int nxpsc_read_records(nxpsc_card_t *card, uint8_t file_no, uint32_t record_no,
 int nxpsc_clear_record_file(nxpsc_card_t *card, uint8_t file_no);
 
 int nxpsc_commit_transaction(nxpsc_card_t *card);
+// CommitTransaction with option 0x01: the card returns TMC (4) || TMV (8).
+// Requires an application with a TMAC file. tmc and tmv are written only on
+// NXPSC_OK. The reported TMC is the already incremented counter, the one that
+// went into the session key, so it is passed to nxpsc_tmac_compute unchanged
+int nxpsc_commit_transaction_tmac(nxpsc_card_t *card, uint8_t tmc[4], uint8_t tmv[8]);
 int nxpsc_abort_transaction(nxpsc_card_t *card);
 // EV2 transaction MAC file support
 int nxpsc_commit_reader_id(nxpsc_card_t *card, const uint8_t *reader_id, size_t len,
@@ -400,6 +405,22 @@ bool nxpsc_get_iso_chaining(const nxpsc_card_t *card);
 int nxpsc_create_transaction_mac_file(nxpsc_card_t *card, uint8_t file_no,
                                       nxpsc_commmode_t comm, const nxpsc_access_t *access,
                                       const nxpsc_key_t *tm_key, uint8_t key_version);
+
+// The transaction MAC a card would return, computed on the host: no card, no
+// I/O. tm_key is the AppTransactionMACKey the TMAC file was created with, uid
+// the card's 7 byte UID, tmc the counter CommitTransaction reported, and tmi
+// the transaction MAC input the card accumulated (rebuilt by the caller, whole
+// 16 byte blocks). A back office compares this against the card's TMV
+int nxpsc_tmac_compute(const nxpsc_key_t *tm_key, const uint8_t *uid, size_t uid_len,
+                       const uint8_t tmc[4], const uint8_t *tmi, size_t tmi_len,
+                       uint8_t tmv[8]);
+
+// The TMI a card accumulates for one WriteRecord, built from the record alone:
+// Cmd || FileNo || Offset || Length || ZeroPadding || Data, 16 + data rounded
+// up to 16 bytes. The data is the plain record whatever the communication mode
+int nxpsc_tmac_tmi_write_record(uint8_t file_no, uint32_t offset,
+                                const uint8_t *data, size_t data_len,
+                                uint8_t *tmi, size_t cap, size_t *tmi_len);
 
 // delegated application management, for multi issuer cards
 typedef struct {

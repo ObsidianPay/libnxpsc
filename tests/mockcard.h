@@ -24,6 +24,7 @@
 
 #define MOCK_MAX_FRAMES     32
 #define MOCK_FRAME_SIZE     128
+#define MOCK_TMI_SIZE       256
 
 typedef enum {
     MOCK_AUTH_NONE = 0,
@@ -69,6 +70,17 @@ typedef struct {
     uint8_t pc_exchanged[32];   // interleaved proximity check challenge and answer
     size_t pc_len;
     bool pc_bad_mac;            // make the card answer with a wrong MAC
+
+    // transaction MAC. the AppTransactionMACKey reaches a real card enciphered
+    // inside CreateTransactionMACFile; the mock does not decipher command data,
+    // so the test states the key here and the mock only notes that the file
+    // exists. tmc counts committed transactions, tmi is what the card
+    // accumulated during the ongoing one
+    bool tm_file;
+    uint8_t tm_key[16];
+    uint32_t tmc;
+    uint8_t tmi[MOCK_TMI_SIZE];
+    size_t tmi_len;
 
     uint8_t tx[MOCK_MAX_FRAMES][MOCK_FRAME_SIZE];
     size_t tx_len[MOCK_MAX_FRAMES];
