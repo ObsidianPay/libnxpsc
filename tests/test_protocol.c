@@ -432,14 +432,20 @@ static void test_file_settings(void) {
     mock_init(&mock, DESFIRE_EV1);
     mock_transport(&mock, &transport);
 
+    // access rights 0x00EE: read and write denied to keys 0 and 0, the rest free
+    nxpsc_access_t access = {0x00, 0x00, 0x0E, 0x0E};
+
     bool ok = (nxpsc_open(&transport, &card) == NXPSC_OK);
+    ok = ok && (nxpsc_create_std_file(card, 0x01, 0, NXPSC_COMM_PLAIN, &access, 0x20) == NXPSC_OK);
     ok = ok && (nxpsc_get_file_settings(card, 0x01, &settings) == NXPSC_OK);
     ok = ok && (settings.type == NXPSC_FILE_STD);
     ok = ok && (settings.comm == NXPSC_COMM_PLAIN);
     ok = ok && (settings.size == 0x20);
-    // access rights 0x00EE, read and write are free, the rest denied
     ok = ok && (settings.access.read == 0x00);
     ok = ok && (settings.access.change == 0x0E);
+
+    // a file the card does not hold
+    ok = ok && (nxpsc_get_file_settings(card, 0x09, &settings) != NXPSC_OK);
 
     check("GetFileSettings decoding", ok);
     nxpsc_close(card);
@@ -1005,6 +1011,12 @@ static void test_info_parsing(void) {
     size_t siglen = 0;
     ok = ok && (nxpsc_get_signature(card, sig, sizeof(sig), &siglen) == NXPSC_OK);
     ok = ok && (siglen == 56) && (sig[0] == 0xA0) && (sig[55] == 0xD7);
+
+    // the mock reports the files it holds, so give it some to report
+    nxpsc_access_t any = {0, 0, 0, 0};
+    ok = ok && (nxpsc_create_std_file(card, 0x00, 0, NXPSC_COMM_PLAIN, &any, 32) == NXPSC_OK);
+    ok = ok && (nxpsc_create_std_file(card, 0x01, 0, NXPSC_COMM_PLAIN, &any, 32) == NXPSC_OK);
+    ok = ok && (nxpsc_create_std_file(card, 0x02, 0, NXPSC_COMM_PLAIN, &any, 32) == NXPSC_OK);
 
     uint8_t ids[NXPSC_MAX_FILES] = {0};
     size_t count = 0;

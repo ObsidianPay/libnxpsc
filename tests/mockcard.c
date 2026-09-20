@@ -1245,14 +1245,11 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             break;                      // the acknowledgement follows below
         }
 
-        case 0x6F: {                    // GetFileIDs
-            uint8_t ids[MOCK_MAX_FILES] = {0x00, 0x01, 0x02};
-            size_t count = 3;           // nothing created: the older tests' fixture
-            if (mock->file_count > 0) {
-                count = mock->file_count;
-                for (size_t i = 0; i < count; i++) {
-                    ids[i] = mock->files[i].file_no;
-                }
+        case 0x6F: {                    // GetFileIDs, the files the mock holds
+            uint8_t ids[MOCK_MAX_FILES] = {0};
+            size_t count = mock->file_count;
+            for (size_t i = 0; i < count; i++) {
+                ids[i] = mock->files[i].file_no;
             }
             if (mock->secure_active) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, ids, count,
@@ -1273,27 +1270,10 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             uint8_t file_no = (tx_len > 1) ? tx[1] : 0;
             const mock_file_t *file = mock_find_file(mock, file_no);
             if (file == NULL) {
-                if (mock->file_count > 0) {
-                    int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
-                                               rx, cap, rx_len);       // FILE_NOT_FOUND
-                    mock_secure_abort(mock);
-                    return rc;
-                }
-                // the fixture: a standard data file, plain, rights 0xEE00, 32 bytes
-                static const uint8_t fixture[7] = {0x00, 0x00, 0xEE, 0x00, 0x20, 0x00, 0x00};
-                if (mock->secure_active) {
-                    int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, fixture, sizeof(fixture),
-                                               0x00, false, rx, cap, rx_len);
-                    mock_secure_advance(mock);
-                    return rc;
-                }
-                if (cap < sizeof(fixture) + 1) {
-                    return NXPSC_E_LENGTH;
-                }
-                rx[0] = 0x00;
-                memcpy(rx + 1, fixture, sizeof(fixture));
-                *rx_len = sizeof(fixture) + 1;
-                return NXPSC_OK;
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
+                                           rx, cap, rx_len);       // FILE_NOT_FOUND
+                mock_secure_abort(mock);
+                return rc;
             }
 
             uint8_t payload[24] = {0};
