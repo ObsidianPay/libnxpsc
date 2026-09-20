@@ -1099,8 +1099,8 @@ int nxpsc_commit_transaction_tmac(nxpsc_card_t *card, uint8_t tmc[4], uint8_t tm
     // Option 0x01 requests TMC and TMV in the response
     uint8_t payload[1] = { 0x01 };
 
-    // Response payload expects: TMC (4 bytes) + TMV (8 bytes) = 12 bytes
-    uint8_t resp[12] = {0};
+    // TMC (4 bytes) + TMV (8 bytes) = 12 + OVERHEAD bytes
+    uint8_t resp[32] = {0};
     size_t resp_len = 0;
 
     int status = nxpsc_exchange(card, DF_COMMIT_TRANSACTION, payload, sizeof(payload),
@@ -1109,7 +1109,7 @@ int nxpsc_commit_transaction_tmac(nxpsc_card_t *card, uint8_t tmc[4], uint8_t tm
 
     // Only write output parameters if the transaction succeeds
     if (status == NXPSC_OK) {
-        // Ensure the card returned exactly the 12 bytes expected
+        // TMC (4) + TMV (8) = 12
         if (resp_len != 12) {
             return NXPSC_E_LENGTH;
         }
