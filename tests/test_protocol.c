@@ -1393,6 +1393,55 @@ static void test_commit_reader_id(void) {
     nxpsc_close(card);
 }
 
+// The EV1 CMAC runs through the answers as well as the commands, so both sides
+// have to keep the IV each MAC leaves behind. One command proves nothing: it is
+// the second that fails when a side forgets. The mock used to compute its
+// response MAC into a throwaway copy of the card context, and nothing caught it
+// because no test had ever issued two MACed EV1 commands in a row.
+static void test_ev1_chain_survives_several_commands(void) {
+    static const uint8_t session_enc[16] = {
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+        0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F
+    };
+    static const uint8_t session_mac[16] = {
+        0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+        0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F
+    };
+    static const uint8_t iv[16] = {0};
+    static const uint8_t ti[4] = {0x00, 0x00, 0x00, 0x00};
+
+    mock_card_t mock;
+    nxpsc_card_t *card = NULL;
+    bool ok = setup_secure_session(&mock, &card, DESFIRE_EV1, NXPSC_CHAN_EV1,
+                                   NXPSC_KEY_AES128, session_enc, session_mac, iv, ti, 0);
+
+    if (ok) {
+        // reads are what the EV1 channel MACs, so they are what exercises the
+        // chain. The file holds a byte per position so a wrong answer shows
+        mock.read_comm = NXPSC_COMM_MAC;
+        mock.files[0].file_no = 0x01;
+        mock.files[0].type = 0x00;
+        mock.files[0].comm = NXPSC_COMM_MAC;
+        mock.files[0].size = 16;
+        for (size_t i = 0; i < 16; i++) {
+            mock.files[0].data[i] = (uint8_t)(0xA0 + i);
+        }
+        mock.file_count = 1;
+
+        uint8_t buf[32] = {0};
+        size_t len = 0;
+        for (int round = 0; round < 4 && ok; round++) {
+            memset(buf, 0, sizeof(buf));
+            ok = ok && (nxpsc_read_data(card, 0x01, 0, 16, NXPSC_COMM_MAC, buf, sizeof(buf), &len)
+                        == NXPSC_OK);
+            ok = ok && (len == 16) && (buf[0] == 0xA0) && (buf[15] == 0xAF);
+        }
+    }
+
+    check("the EV1 chain survives several commands", ok);
+    nxpsc_close(card);
+}
+
 // One round trip per command the mock answers from state: write something,
 // read it back, and get what was written. A fixed table cannot creep back in
 // without one of these failing.
@@ -2313,6 +2362,7 @@ int main(void) {
     test_commit_reader_id();
     test_created_files_are_reported();
     test_mock_answers_what_was_written();
+    test_ev1_chain_survives_several_commands();
     test_transaction_mac();
     test_diversification_wrapper();
     test_reporting_helpers();

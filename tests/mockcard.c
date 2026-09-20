@@ -678,6 +678,16 @@ static bool mock_has_valid_ev2_request_mac(mock_card_t *mock, const uint8_t *tx,
 // MAC such an answer; on the earlier ones it is a bare status, and building it
 // through the secure path would advance a CMAC chain the library never
 // advanced for it
+// Whether the answer to a command that returns data carries a MAC. Which
+// commands MAC their answer is per channel and per command in the library
+// itself (each one names its modes in its nxpsc_exchange call), and the
+// directory style commands only do so from EV2 on. A read is the exception and
+// carries its own mode in mock_card_t::read_comm
+static bool mock_macs_data_reply(const mock_card_t *mock) {
+    return mock->secure_active
+           && (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP);
+}
+
 static int mock_ack(mock_card_t *mock, uint8_t cmd, uint8_t *rx, size_t cap, size_t *rx_len) {
     if (mock->secure_active && mock->secure_channel != NXPSC_CHAN_D40) {
         int rc = mock_secure_reply(mock, cmd, NXPSC_COMM_MAC, NULL, 0, 0x00, false, rx, cap, rx_len);
@@ -1245,14 +1255,9 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             mock->auth_scheme = MOCK_AUTH_EV2;
             return auth_begin_ev2(mock, tx_len > 2, rx, cap, rx_len);
 
-        case 0xCA: {                    // CreateApplication
-            size_t len = 0;
-            if (mock_write_payload(mock, tx, tx_len, 0, &len) == false) {
-                len = tx_len - 1;       // the payload is in the clear
-            }
-            mock_note_app(mock, tx + 1, len);
+        case 0xCA:                      // CreateApplication
+            mock_note_app(mock, tx + 1, tx_len - 1);
             return mock_ack(mock, tx[0], rx, cap, rx_len);
-        }
 
         case 0x5A:                      // SelectApplication
             if (tx_len >= 4) {
@@ -1275,8 +1280,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                 aids[aids_len++] = (uint8_t)((mock->apps[i].aid >> 16) & 0xFF);
             }
 
-            if (mock->secure_active && tx_len >= 9 &&
-                    (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
+            if (mock_macs_data_reply(mock) && tx_len >= 9) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, aids, aids_len,
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1320,8 +1324,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             payload[1] = (uint8_t)(app->num_keys
                                    | ((app->key_type == NXPSC_KEY_AES128) ? 0x80
                                       : (app->key_type == NXPSC_KEY_3K3DES) ? 0x40 : 0x00));
-            if (mock->secure_active
-                    && (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1347,8 +1350,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             }
 
             uint8_t version = app->key_version[key_no];
-            if (mock->secure_active
-                    && (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, &version, 1, 0x00, false,
                                            rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1413,7 +1415,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                 payload_len += size;
             }
 
-            if (mock->secure_active) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, payload_len, 0x00,
                                            false, rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1453,12 +1455,8 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
         case 0xCB:                      // CreateBackupDataFile
         case 0xCC:                      // CreateValueFile
         case 0xCD: {                    // CreateStdDataFile
-            // the settings travel in the clear, so the mock can remember them
-            size_t len = tx_len - 1;
-            if (mock->secure_active && len >= 8) {
-                len -= 8;
-            }
-            mock_note_file(mock, tx[0], tx + 1, len);
+            // the settings travel in the clear at the front of the payload
+            mock_note_file(mock, tx[0], tx + 1, tx_len - 1);
             return mock_ack(mock, tx[0], rx, cap, rx_len);
         }
 
@@ -1480,7 +1478,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             for (size_t i = 0; i < count; i++) {
                 ids[i] = mock->files[i].file_no;
             }
-            if (mock->secure_active) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, ids, count,
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1507,7 +1505,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
 
             uint8_t payload[24] = {0};
             size_t payload_len = mock_file_settings(file, payload);
-            if (mock->secure_active) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, payload_len,
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1539,7 +1537,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             payload[2] = (uint8_t)((file->value >> 16) & 0xFF);
             payload[3] = (uint8_t)((file->value >> 24) & 0xFF);
 
-            if (mock->secure_active) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
@@ -1842,7 +1840,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             mock->tmi_len = 0;          // a new transaction starts here
             mock_commit_files(mock);
 
-            if (mock->secure_active) {
+            if (mock_macs_data_reply(mock)) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
                                            0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);

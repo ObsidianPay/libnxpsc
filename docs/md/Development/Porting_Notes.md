@@ -86,6 +86,30 @@ Where a command's payload is entirely card specific, the library takes a raw
 buffer rather than pretending to understand it. Those are marked "payload per
 card manual" in the header.
 
+## Two lessons from the mock card
+
+**A test that does not write what it reads proves nothing.** The mock card once
+answered reads from fixed tables: a set list of file ids, a standard data file's
+settings whatever the file was, synthetic records of a fixed size, a value of
+12345. Six tests were written against those tables, and every one of them passed
+by reading something it had never written. They would have gone on passing if
+the mock had returned those answers for a card with no files at all, which is
+exactly what a personalisation station checks for before it issues a card. When
+a test reads, have it create and write first, and assert on what it wrote; where
+the mock genuinely cannot know something — data that reached it enciphered, or a
+write the library chained across frames — it answers with an error, and the test
+should assert that error rather than a plausible value.
+
+**Read the library's own encoder before teaching the mock a channel.** Which
+commands carry a MAC, and which answers carry one, is per channel and per
+command: EV1 computes a CMAC for every command but only transmits it for some
+(`transmits_mac`), while expecting one on every answer; the legacy channel MACs
+the answers to reads and nothing else; EV2 and LRP MAC both directions. Each
+command names the modes it uses in its own `nxpsc_exchange` call, and
+`encode_ev1` / `decode_ev1` say what happens to the chain. Patching the mock
+channel by channel until the tests go green costs far more than reading those
+three places once.
+
 ## Unverified areas
 
 - The AES256 path of AN10922 has no published test vector. The construction
@@ -101,5 +125,11 @@ card manual" in the header.
 - `nxpsc_session_key_lrp()` ignores its encryption key argument, which matches
   the proxmark3 behaviour and the note, but is worth re-reading if LRP ever
   misbehaves on hardware.
+- The EV1 CMAC chain runs through answers as well as commands, and the mock card
+  used to advance its copy of it and throw the result away, so any two MACed EV1
+  commands in a row disagreed. The library keeps the chain correctly in both
+  directions (`encode_ev1` and `decode_ev1` both pass the card's own IV), and a
+  test now issues several MACed EV1 reads in a row to keep it that way. No
+  hardware here has an EV1 card, so that test is the only thing watching it.
 
 ^[Top](#top)
