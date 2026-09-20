@@ -16,6 +16,7 @@
 // libnxpsc - DESFire application, file and key management
 //-----------------------------------------------------------------------------
 
+#include "nxpsc/nxpsc.h"
 #include "nxpsc_internal.h"
 
 #include <stdlib.h>
@@ -1086,6 +1087,40 @@ int nxpsc_commit_transaction(nxpsc_card_t *card) {
     return nxpsc_exchange(card, DF_COMMIT_TRANSACTION, NULL, 0, eff(card, MODE_MAC),
                           eff(card, MODE_MAC), resp, sizeof(resp), &resp_len);
 }
+
+// CommitTransaction with option 0x01: the card returns TMC (4) || TMV (8).
+// Requires an application with a TMAC file. tmc and tmv are written only on
+// NXPSC_OK.
+int nxpsc_commit_transaction_tmac(nxpsc_card_t *card, uint8_t tmc[4], uint8_t tmv[8]) {
+    if (card == NULL || tmc == NULL || tmv == NULL) {
+        return NXPSC_E_PARAM;
+    }
+
+    // Option 0x01 requests TMC and TMV in the response
+    uint8_t payload[1] = { 0x01 };
+
+    // Response payload expects: TMC (4 bytes) + TMV (8 bytes) = 12 bytes
+    uint8_t resp[12] = {0};
+    size_t resp_len = 0;
+
+    int status = nxpsc_exchange(card, DF_COMMIT_TRANSACTION, payload, sizeof(payload),
+                               eff(card, MODE_MAC), eff(card, MODE_MAC),
+                               resp, sizeof(resp), &resp_len);
+
+    // Only write output parameters if the transaction succeeds
+    if (status == NXPSC_OK) {
+        // Ensure the card returned exactly the 12 bytes expected
+        if (resp_len != 12) {
+            return NXPSC_E_LENGTH;
+        }
+
+        memcpy(tmc, &resp[0], 4);
+        memcpy(tmv, &resp[4], 8);
+    }
+
+    return status;
+}
+
 
 int nxpsc_abort_transaction(nxpsc_card_t *card) {
     if (card == NULL) {
