@@ -151,6 +151,114 @@ static void mock_secure_advance(mock_card_t *mock) {
 }
 
 //-----------------------------------------------------------------------------
+// files
+//
+// The mock keeps what it saw created so that GetFileIDs and GetFileSettings
+// answer the truth rather than a fixture. Create commands carry their settings
+// in the clear; CreateTransactionMACFile does not, because it carries a key, so
+// that one file is stated through mock_card_t like the key itself.
+//-----------------------------------------------------------------------------
+static mock_file_t *mock_find_file(mock_card_t *mock, uint8_t file_no) {
+    for (size_t i = 0; i < mock->file_count; i++) {
+        if (mock->files[i].file_no == file_no) {
+            return &mock->files[i];
+        }
+    }
+    return NULL;
+}
+
+static mock_file_t *mock_add_file(mock_card_t *mock, uint8_t file_no) {
+    mock_file_t *file = mock_find_file(mock, file_no);
+    if (file != NULL) {
+        return file;
+    }
+    if (mock->file_count >= MOCK_MAX_FILES) {
+        return NULL;
+    }
+    file = &mock->files[mock->file_count++];
+    memset(file, 0, sizeof(*file));
+    file->file_no = file_no;
+    return file;
+}
+
+static uint32_t mock_u24(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+}
+
+// CreateStdDataFile and friends: FileNo || [ISO FID] || CommMode || AccessRights
+// || the type's own fields. The ISO file id is present when bit 5 of the file
+// option byte was set at creation, which the library only does when asked
+static void mock_note_file(mock_card_t *mock, uint8_t cmd, const uint8_t *data, size_t len) {
+    static const size_t header = 1 + 1 + 2;     // file, comm, rights
+    if (len < header) {
+        return;
+    }
+
+    uint8_t type;
+    size_t need = header;
+    switch (cmd) {
+        case 0xCD: type = 0x00; need += 3; break;       // standard data
+        case 0xCB: type = 0x01; need += 3; break;       // backup data
+        case 0xCC: type = 0x02; need += 17; break;      // value
+        case 0xC1: type = 0x03; need += 6; break;       // linear record
+        case 0xC0: type = 0x04; need += 6; break;       // cyclic record
+        default: return;
+    }
+    if (len < need) {
+        return;
+    }
+
+    mock_file_t *file = mock_add_file(mock, data[0]);
+    if (file == NULL) {
+        return;
+    }
+    file->type = type;
+    file->comm = (data[1] == 0x03) ? NXPSC_COMM_FULL
+               : (data[1] == 0x01) ? NXPSC_COMM_MAC : NXPSC_COMM_PLAIN;
+    file->access = (uint16_t)((uint16_t)data[2] | ((uint16_t)data[3] << 8));
+    if (type == 0x00 || type == 0x01) {
+        file->size = mock_u24(data + header);
+    }
+    else if (type == 0x03 || type == 0x04) {
+        file->record_size = mock_u24(data + header);
+        file->max_records = mock_u24(data + header + 3);
+    }
+}
+
+// the answer to GetFileSettings, in the wire layout the library decodes
+static size_t mock_file_settings(const mock_file_t *file, uint8_t *out) {
+    size_t len = 0;
+    out[len++] = file->type;
+    out[len++] = (file->comm == NXPSC_COMM_FULL) ? 0x03
+               : (file->comm == NXPSC_COMM_MAC) ? 0x01 : 0x00;
+    out[len++] = (uint8_t)(file->access & 0xFF);
+    out[len++] = (uint8_t)(file->access >> 8);
+
+    if (file->type == 0x03 || file->type == 0x04) {
+        out[len++] = (uint8_t)(file->record_size & 0xFF);
+        out[len++] = (uint8_t)((file->record_size >> 8) & 0xFF);
+        out[len++] = (uint8_t)((file->record_size >> 16) & 0xFF);
+        out[len++] = (uint8_t)(file->max_records & 0xFF);
+        out[len++] = (uint8_t)((file->max_records >> 8) & 0xFF);
+        out[len++] = (uint8_t)((file->max_records >> 16) & 0xFF);
+        // current records: the mock does not keep record contents, so a freshly
+        // created file reports none
+        out[len++] = 0x00;
+        out[len++] = 0x00;
+        out[len++] = 0x00;
+    }
+    else if (file->type == 0x05) {
+        // a transaction MAC file reports nothing beyond its rights
+    }
+    else {
+        out[len++] = (uint8_t)(file->size & 0xFF);
+        out[len++] = (uint8_t)((file->size >> 8) & 0xFF);
+        out[len++] = (uint8_t)((file->size >> 16) & 0xFF);
+    }
+    return len;
+}
+
+//-----------------------------------------------------------------------------
 // transaction MAC, the card's side
 //
 // Written from the MF2DL(H)x0 data sheet rev 3.3 section 10.3 on its own, so
@@ -1103,31 +1211,115 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             return NXPSC_OK;
         }
 
-        case 0x6F:                      // GetFileIDs
-            if (cap < 4) {
-                return NXPSC_E_LENGTH;
+        case 0xC0:                      // CreateCyclicRecordFile
+        case 0xC1:                      // CreateLinearRecordFile
+        case 0xCB:                      // CreateBackupDataFile
+        case 0xCC:                      // CreateValueFile
+        case 0xCD: {                    // CreateStdDataFile
+            // the settings travel in the clear, so the mock can remember them
+            size_t len = tx_len - 1;
+            if (mock->secure_active && len >= 8) {
+                len -= 8;
+            }
+            mock_note_file(mock, tx[0], tx + 1, len);
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
+                                           rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
             }
             rx[0] = 0x00;
-            rx[1] = 0x00;
-            rx[2] = 0x01;
-            rx[3] = 0x02;
-            *rx_len = 4;
+            *rx_len = 1;
             return NXPSC_OK;
+        }
 
-        case 0xF5:                      // GetFileSettings, standard data file
-            if (cap < 8) {
+        case 0xDF: {                    // DeleteFile
+            uint8_t file_no = (tx_len > 1) ? tx[1] : 0;
+            for (size_t i = 0; i < mock->file_count; i++) {
+                if (mock->files[i].file_no == file_no) {
+                    mock->files[i] = mock->files[mock->file_count - 1];
+                    mock->file_count--;
+                    break;
+                }
+            }
+            break;                      // the acknowledgement follows below
+        }
+
+        case 0x6F: {                    // GetFileIDs
+            if (mock->file_count == 0) {
+                // nothing has been created: the fixture the older tests expect
+                if (cap < 4) {
+                    return NXPSC_E_LENGTH;
+                }
+                rx[0] = 0x00;
+                rx[1] = 0x00;
+                rx[2] = 0x01;
+                rx[3] = 0x02;
+                *rx_len = 4;
+                return NXPSC_OK;
+            }
+
+            uint8_t ids[MOCK_MAX_FILES] = {0};
+            for (size_t i = 0; i < mock->file_count; i++) {
+                ids[i] = mock->files[i].file_no;
+            }
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, ids, mock->file_count,
+                                           0x00, false, rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            if (cap < mock->file_count + 1) {
                 return NXPSC_E_LENGTH;
             }
             rx[0] = 0x00;
-            rx[1] = 0x00;               // std data file
-            rx[2] = 0x00;               // plain
-            rx[3] = 0xEE;               // access rights
-            rx[4] = 0x00;
-            rx[5] = 0x20;               // size 0x20
-            rx[6] = 0x00;
-            rx[7] = 0x00;
-            *rx_len = 8;
+            memcpy(rx + 1, ids, mock->file_count);
+            *rx_len = mock->file_count + 1;
             return NXPSC_OK;
+        }
+
+        case 0xF5: {                    // GetFileSettings
+            uint8_t file_no = (tx_len > 1) ? tx[1] : 0;
+            const mock_file_t *file = mock_find_file(mock, file_no);
+            if (file == NULL) {
+                if (mock->file_count > 0) {
+                    int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
+                                               rx, cap, rx_len);       // FILE_NOT_FOUND
+                    mock_secure_abort(mock);
+                    return rc;
+                }
+                // the fixture: a standard data file, plain, rights 0xEE00, 32 bytes
+                if (cap < 8) {
+                    return NXPSC_E_LENGTH;
+                }
+                rx[0] = 0x00;
+                rx[1] = 0x00;
+                rx[2] = 0x00;
+                rx[3] = 0xEE;
+                rx[4] = 0x00;
+                rx[5] = 0x20;
+                rx[6] = 0x00;
+                rx[7] = 0x00;
+                *rx_len = 8;
+                return NXPSC_OK;
+            }
+
+            uint8_t payload[24] = {0};
+            size_t payload_len = mock_file_settings(file, payload);
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, payload_len,
+                                           0x00, false, rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            if (cap < payload_len + 1) {
+                return NXPSC_E_LENGTH;
+            }
+            rx[0] = 0x00;
+            memcpy(rx + 1, payload, payload_len);
+            *rx_len = payload_len + 1;
+            return NXPSC_OK;
+        }
 
         case 0x6C:                      // GetValue
             if (cap < 5) {
@@ -1270,6 +1462,14 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             mock->tm_file = true;
             mock->tmc = 0;
             mock->tmi_len = 0;
+            {
+                mock_file_t *file = mock_add_file(mock, (mock->tm_file_no == 0) ? 0x02 : mock->tm_file_no);
+                if (file != NULL) {
+                    file->type = 0x05;
+                    file->comm = mock->tm_file_comm;
+                    file->access = mock->tm_file_access;
+                }
+            }
             if (mock->secure_active) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
                                            rx, cap, rx_len);

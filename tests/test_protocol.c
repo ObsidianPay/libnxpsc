@@ -1307,6 +1307,52 @@ static void test_commit_reader_id(void) {
     nxpsc_close(card);
 }
 
+// The mock answers GetFileIDs and GetFileSettings from what it saw created, so
+// a caller that reads its own file settings back gets what it asked for.
+static void test_created_files_are_reported(void) {
+    static const uint8_t session_enc[16] = {
+        0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+        0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F
+    };
+    static const uint8_t session_mac[16] = {
+        0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67,
+        0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F
+    };
+    static const uint8_t iv[16] = {0};
+    static const uint8_t ti[4] = {0xCA, 0xFE, 0xBA, 0xBE};
+
+    mock_card_t mock;
+    nxpsc_card_t *card = NULL;
+    bool ok = setup_secure_session(&mock, &card, DESFIRE_EV3, NXPSC_CHAN_EV2,
+                                  NXPSC_KEY_AES128, session_enc, session_mac, iv, ti, 0);
+
+    if (ok) {
+        nxpsc_access_t access = {2, 2, 2, 0};
+        ok = ok && (nxpsc_create_record_file(card, true, 0x01, 0, NXPSC_COMM_MAC, &access, 32, 4)
+                    == NXPSC_OK);
+
+        uint8_t ids[NXPSC_MAX_FILES] = {0};
+        size_t count = 0;
+        ok = ok && (nxpsc_get_file_ids(card, ids, sizeof(ids), &count) == NXPSC_OK);
+        ok = ok && (count == 1) && (ids[0] == 0x01);
+
+        nxpsc_file_settings_t settings;
+        memset(&settings, 0, sizeof(settings));
+        ok = ok && (nxpsc_get_file_settings(card, 0x01, &settings) == NXPSC_OK);
+        ok = ok && (settings.type == NXPSC_FILE_CYCLIC);
+        ok = ok && (settings.comm == NXPSC_COMM_MAC);
+        ok = ok && (settings.record_size == 32) && (settings.max_records == 4);
+        ok = ok && (settings.access.read == 2) && (settings.access.write == 2);
+        ok = ok && (settings.access.read_write == 2) && (settings.access.change == 0);
+
+        // a file that was never created is not there
+        ok = ok && (nxpsc_get_file_settings(card, 0x07, &settings) != NXPSC_OK);
+    }
+
+    check("the mock reports the files it was asked to create", ok);
+    nxpsc_close(card);
+}
+
 // The transaction MAC: the card computes a TMV over what it saw, the back
 // office recomputes it from what it expected. There are no published vectors
 // for this, so what is checked here is that two independent readings of the
@@ -2077,6 +2123,7 @@ int main(void) {
     test_data_access_framing();
     test_iso7816_wrappers();
     test_commit_reader_id();
+    test_created_files_are_reported();
     test_transaction_mac();
     test_diversification_wrapper();
     test_reporting_helpers();

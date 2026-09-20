@@ -25,6 +25,19 @@
 #define MOCK_MAX_FRAMES     32
 #define MOCK_FRAME_SIZE     128
 #define MOCK_TMI_SIZE       256
+#define MOCK_MAX_FILES      8
+
+// a file as the mock remembers it, enough to answer GetFileIDs and
+// GetFileSettings with what was actually asked for
+typedef struct {
+    uint8_t file_no;
+    uint8_t type;               // nxpsc_filetype_t
+    uint8_t comm;               // nxpsc_commmode_t
+    uint16_t access;            // packed access rights, as on the wire
+    uint32_t size;              // data files
+    uint32_t record_size;       // record files
+    uint32_t max_records;
+} mock_file_t;
 
 typedef enum {
     MOCK_AUTH_NONE = 0,
@@ -81,6 +94,18 @@ typedef struct {
     uint32_t tmc;
     uint8_t tmi[MOCK_TMI_SIZE];
     size_t tmi_len;
+
+    // CreateTransactionMACFile travels enciphered, so its file number and
+    // settings are stated here too, the same way the key is. Everything else
+    // the mock knows about a file it read off the wire
+    uint8_t tm_file_no;             // 0 means 0x02
+    uint8_t tm_file_comm;           // nxpsc_commmode_t
+    uint16_t tm_file_access;        // packed, as on the wire
+
+    // files the mock has seen created, in creation order. While none exist the
+    // canned answers stay, so the tests that predate this keep their fixtures
+    mock_file_t files[MOCK_MAX_FILES];
+    size_t file_count;
 
     uint8_t tx[MOCK_MAX_FRAMES][MOCK_FRAME_SIZE];
     size_t tx_len[MOCK_MAX_FRAMES];
