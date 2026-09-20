@@ -26,9 +26,15 @@
 #define MOCK_FRAME_SIZE     128
 #define MOCK_TMI_SIZE       256
 #define MOCK_MAX_FILES      8
+#define MOCK_MAX_APPS       8
+#define MOCK_MAX_APP_KEYS   14
+#define MOCK_MAX_RECORDS    8
+#define MOCK_RECORD_SIZE    64
+#define MOCK_FILE_DATA      256
 
-// a file as the mock remembers it, enough to answer GetFileIDs and
-// GetFileSettings with what was actually asked for
+// a file as the mock remembers it: its settings as they were created, and its
+// contents as they were written. Everything the mock answers about a file comes
+// from here, so a caller that reads back what it wrote gets what it wrote
 typedef struct {
     uint8_t file_no;
     uint8_t type;               // nxpsc_filetype_t
@@ -37,7 +43,47 @@ typedef struct {
     uint32_t size;              // data files
     uint32_t record_size;       // record files
     uint32_t max_records;
+
+    // data files: what was written, zero where nothing has been. A backup file
+    // stages its writes until CommitTransaction, as on a real card
+    uint8_t data[MOCK_FILE_DATA];
+    uint8_t pending_data[MOCK_FILE_DATA];
+    bool has_pending_data;
+
+    // record files: oldest first, cyclic once full. A record written during a
+    // transaction is pending until CommitTransaction, as on a real card
+    uint8_t records[MOCK_MAX_RECORDS][MOCK_RECORD_SIZE];
+    size_t record_count;
+    uint8_t pending_record[MOCK_RECORD_SIZE];
+    size_t pending_len;
+    bool has_pending_record;
+
+    // value files: the committed value, and the pending one during a transaction
+    int32_t value;
+    int32_t pending_value;
+    bool has_pending_value;
+
+    // set when a write arrived enciphered: the mock does not decipher command
+    // data, so it no longer knows what the file holds. Reads then fail rather
+    // than answer with something that looks like data
+    bool contents_unknown;
 } mock_file_t;
+
+// an application as the mock remembers it, from CreateApplication
+typedef struct {
+    bool present;
+    uint32_t aid;
+    uint8_t key_settings;
+    uint8_t num_keys;
+    uint8_t key_type;           // nxpsc_keytype_t
+    uint16_t iso_fid;
+    uint8_t df_name[16];
+    size_t df_name_len;
+    // the version of each key. A changed key's version rides inside the
+    // cryptogram, which the mock cannot read, so it takes the one the caller
+    // stated through mock_card_t::change_key_version
+    uint8_t key_version[MOCK_MAX_APP_KEYS];
+} mock_app_t;
 
 typedef enum {
     MOCK_AUTH_NONE = 0,
@@ -101,6 +147,12 @@ typedef struct {
     uint8_t tm_file_no;             // 0 means 0x02
     uint8_t tm_file_comm;           // nxpsc_commmode_t
     uint16_t tm_file_access;        // packed, as on the wire
+
+    // applications the mock has seen created, and the version a changed key
+    // takes (ChangeKey carries it enciphered, so the caller states it)
+    mock_app_t apps[MOCK_MAX_APPS];
+    size_t app_count;
+    uint8_t change_key_version;
 
     // files the mock has seen created, in creation order. While none exist the
     // canned answers stay, so the tests that predate this keep their fixtures

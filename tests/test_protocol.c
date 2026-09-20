@@ -105,13 +105,23 @@ static bool run_exact_buffer_read_case(nxpsc_cardtype_t type, nxpsc_channel_t ch
     }
 
     mock.read_comm = comm;
-    mock.read_len = 64;
     mock.validate_secure_requests = (channel == NXPSC_CHAN_EV2);
 
     uint8_t buf[64] = {0};
     size_t len = 0;
 
-    ok = (nxpsc_read_data(card, 0x01, 0, 64, comm, buf, sizeof(buf), &len) == NXPSC_OK);
+    // the card answers with what is in the file, and this case is about the
+    // size of that answer, so the file is given its contents directly rather
+    // than through a write in the channel under test
+    mock.files[0].file_no = 0x01;
+    mock.files[0].type = 0x00;
+    mock.files[0].comm = comm;
+    mock.files[0].size = sizeof(buf);
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        mock.files[0].data[i] = (uint8_t)i;
+    }
+    mock.file_count = 1;
+    ok = ok && (nxpsc_read_data(card, 0x01, 0, 64, comm, buf, sizeof(buf), &len) == NXPSC_OK);
     ok = ok && (len == sizeof(buf));
     for (size_t i = 0; ok && i < sizeof(buf); i++) {
         ok = ok && (buf[i] == (uint8_t)i);
@@ -485,17 +495,53 @@ static void test_value_and_data(void) {
     mock_init(&mock, DESFIRE_EV1);
     mock_transport(&mock, &transport);
 
+    nxpsc_access_t access = {0x0E, 0x0E, 0x0E, 0x00};
+
     bool ok = (nxpsc_open(&transport, &card) == NXPSC_OK);
+    ok = ok && (nxpsc_create_value_file(card, 0x01, NXPSC_COMM_PLAIN, &access,
+                                        0, 0x10000, 0x3039, false) == NXPSC_OK);
+    ok = ok && (nxpsc_create_std_file(card, 0x02, 0, NXPSC_COMM_PLAIN, &access, 64) == NXPSC_OK);
 
     int32_t value = 0;
     ok = ok && (nxpsc_get_value(card, 0x01, NXPSC_COMM_PLAIN, &value) == NXPSC_OK);
     ok = ok && (value == 0x3039);
 
+    // a credit only shows once the transaction is committed
+    ok = ok && (nxpsc_credit(card, 0x01, 100, NXPSC_COMM_PLAIN) == NXPSC_OK);
+    ok = ok && (nxpsc_get_value(card, 0x01, NXPSC_COMM_PLAIN, &value) == NXPSC_OK);
+    ok = ok && (value == 0x3039);
+    ok = ok && (nxpsc_commit_transaction(card) == NXPSC_OK);
+    ok = ok && (nxpsc_get_value(card, 0x01, NXPSC_COMM_PLAIN, &value) == NXPSC_OK);
+    ok = ok && (value == 0x3039 + 100);
+
+    // and a debit that is aborted never happened
+    ok = ok && (nxpsc_debit(card, 0x01, 50, NXPSC_COMM_PLAIN) == NXPSC_OK);
+    ok = ok && (nxpsc_abort_transaction(card) == NXPSC_OK);
+    ok = ok && (nxpsc_get_value(card, 0x01, NXPSC_COMM_PLAIN, &value) == NXPSC_OK);
+    ok = ok && (value == 0x3039 + 100);
+
+    static const uint8_t written[16] = {
+        0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+        0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF
+    };
     uint8_t buf[64] = {0};
     size_t len = 0;
-    ok = ok && (nxpsc_read_data(card, 0x01, 0, 16, NXPSC_COMM_PLAIN, buf, sizeof(buf), &len)
+    ok = ok && (nxpsc_write_data(card, 0x02, 0, written, sizeof(written), NXPSC_COMM_PLAIN)
                 == NXPSC_OK);
-    ok = ok && (len == 16) && (buf[0] == 0x00) && (buf[15] == 0x0F);
+    ok = ok && (nxpsc_read_data(card, 0x02, 0, 16, NXPSC_COMM_PLAIN, buf, sizeof(buf), &len)
+                == NXPSC_OK);
+    ok = ok && (len == 16) && (memcmp(buf, written, sizeof(written)) == 0);
+
+    // past the end of what was written, the file reads as zero
+    memset(buf, 0xFF, sizeof(buf));
+    ok = ok && (nxpsc_read_data(card, 0x02, 16, 8, NXPSC_COMM_PLAIN, buf, sizeof(buf), &len)
+                == NXPSC_OK);
+    ok = ok && (len == 8) && (buf[0] == 0x00) && (buf[7] == 0x00);
+
+    // a file the card does not hold is an error, not an answer
+    ok = ok && (nxpsc_get_value(card, 0x08, NXPSC_COMM_PLAIN, &value) != NXPSC_OK);
+    ok = ok && (nxpsc_read_data(card, 0x08, 0, 8, NXPSC_COMM_PLAIN, buf, sizeof(buf), &len)
+                != NXPSC_OK);
 
     check("value and data file access", ok);
     nxpsc_close(card);
@@ -1145,6 +1191,14 @@ static void test_data_access_framing(void) {
 
     bool ok = (nxpsc_open(&transport, &card) == NXPSC_OK);
 
+    // the files these commands work on: the mock answers from what they hold
+    nxpsc_access_t access = {0x0E, 0x0E, 0x0E, 0x00};
+    ok = ok && (nxpsc_create_std_file(card, 2, 0, NXPSC_COMM_PLAIN, &access, 64) == NXPSC_OK);
+    ok = ok && (nxpsc_create_record_file(card, true, 6, 0, NXPSC_COMM_PLAIN, &access, 8, 4)
+                == NXPSC_OK);
+    ok = ok && (nxpsc_create_value_file(card, 5, NXPSC_COMM_PLAIN, &access, 0, 1000, 100, false)
+                == NXPSC_OK);
+
     // WriteData: fileno, offset(3), length(3), data
     mock.tx_count = 0;
     ok = ok && (nxpsc_write_data(card, 2, 0x10, payload, sizeof(payload), NXPSC_COMM_PLAIN)
@@ -1160,14 +1214,27 @@ static void test_data_access_framing(void) {
                 == NXPSC_OK);
     ok = ok && (mock.tx[0][0] == 0x3B) && (mock.tx[0][1] == 0x06);
 
-    // ReadRecords parses whatever the card sends back
+    // ReadRecords hands back the records that were committed, newest first
+    static const uint8_t second[4] = {0x11, 0x22, 0x33, 0x44};
     uint8_t back[64] = {0};
     size_t back_len = 0;
+    ok = ok && (nxpsc_commit_transaction(card) == NXPSC_OK);
+    ok = ok && (nxpsc_write_record(card, 6, 0, second, sizeof(second), NXPSC_COMM_PLAIN)
+                == NXPSC_OK);
+    ok = ok && (nxpsc_commit_transaction(card) == NXPSC_OK);
+
     mock.tx_count = 0;
     ok = ok && (nxpsc_read_records(card, 6, 0, 2, NXPSC_COMM_PLAIN, back, sizeof(back), &back_len)
                 == NXPSC_OK);
     ok = ok && (mock.tx[0][0] == 0xBB) && (back_len == 16);
-    ok = ok && (back[0] == 0x10) && (back[8] == 0x20);
+    ok = ok && (back[0] == 0x11) && (back[8] == 0xDE);
+
+    // a record that was written but not committed is not there yet
+    ok = ok && (nxpsc_write_record(card, 6, 0, payload, sizeof(payload), NXPSC_COMM_PLAIN)
+                == NXPSC_OK);
+    ok = ok && (nxpsc_read_records(card, 6, 0, 3, NXPSC_COMM_PLAIN, back, sizeof(back), &back_len)
+                != NXPSC_OK);
+    ok = ok && (nxpsc_abort_transaction(card) == NXPSC_OK);
 
     mock.tx_count = 0;
     ok = ok && (nxpsc_clear_record_file(card, 6) == NXPSC_OK);

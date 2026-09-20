@@ -158,6 +158,35 @@ static void mock_secure_advance(mock_card_t *mock) {
 // in the clear; CreateTransactionMACFile does not, because it carries a key, so
 // that one file is stated through mock_card_t like the key itself.
 //-----------------------------------------------------------------------------
+static uint32_t mock_u24(const uint8_t *p);
+
+// How long the data of a write is, given the length its header declares. A
+// command MAC may follow the data (EV2 always, the legacy channel in MAC mode)
+// or not (EV1 chains its CMAC without sending it), so rather than keeping a
+// rule per channel the frame is measured against what the header claims.
+// Returns false when neither fits, which means the data was enciphered.
+static bool mock_write_payload(const mock_card_t *mock, const uint8_t *tx, size_t tx_len,
+                               size_t header, size_t *data_len) {
+    if (tx_len < 1 + header) {
+        return false;
+    }
+    size_t declared = mock_u24(tx + 1 + header - 3);
+    size_t present = tx_len - 1 - header;
+    if (present == declared) {
+        *data_len = declared;
+        return true;
+    }
+
+    nxpsc_card_t ctx;
+    mock_secure_ctx(mock, &ctx);
+    size_t mac_len = mock->secure_active ? nxpsc_mac_length(&ctx) : 0;
+    if (mac_len > 0 && present >= mac_len && present - mac_len == declared) {
+        *data_len = declared;
+        return true;
+    }
+    return false;
+}
+
 static mock_file_t *mock_find_file(mock_card_t *mock, uint8_t file_no) {
     for (size_t i = 0; i < mock->file_count; i++) {
         if (mock->files[i].file_no == file_no) {
@@ -199,7 +228,7 @@ static void mock_note_file(mock_card_t *mock, uint8_t cmd, const uint8_t *data, 
     switch (cmd) {
         case 0xCD: type = 0x00; need += 3; break;       // standard data
         case 0xCB: type = 0x01; need += 3; break;       // backup data
-        case 0xCC: type = 0x02; need += 17; break;      // value
+        case 0xCC: type = 0x02; need += 13; break;      // value
         case 0xC1: type = 0x03; need += 6; break;       // linear record
         case 0xC0: type = 0x04; need += 6; break;       // cyclic record
         default: return;
@@ -219,10 +248,69 @@ static void mock_note_file(mock_card_t *mock, uint8_t cmd, const uint8_t *data, 
     if (type == 0x00 || type == 0x01) {
         file->size = mock_u24(data + header);
     }
+    else if (type == 0x02) {
+        // lower limit (4) || upper limit (4) || initial value (4) || limited credit
+        file->value = (int32_t)((uint32_t)data[header + 8] | ((uint32_t)data[header + 9] << 8)
+                                | ((uint32_t)data[header + 10] << 16) | ((uint32_t)data[header + 11] << 24));
+    }
     else if (type == 0x03 || type == 0x04) {
         file->record_size = mock_u24(data + header);
         file->max_records = mock_u24(data + header + 3);
     }
+}
+
+// A record written during a transaction is pending until CommitTransaction
+// applies it, and AbortTransaction throws it away. The file is cyclic: once it
+// holds max_records, the oldest goes
+static void mock_commit_files(mock_card_t *mock) {
+    for (size_t i = 0; i < mock->file_count; i++) {
+        mock_file_t *file = &mock->files[i];
+
+        if (file->has_pending_record) {
+            size_t cap = (file->max_records > MOCK_MAX_RECORDS) ? MOCK_MAX_RECORDS : file->max_records;
+            if (cap == 0) {
+                cap = 1;
+            }
+            if (file->record_count == cap) {
+                memmove(file->records[0], file->records[1], (cap - 1) * MOCK_RECORD_SIZE);
+                file->record_count--;
+            }
+            memcpy(file->records[file->record_count], file->pending_record, MOCK_RECORD_SIZE);
+            file->record_count++;
+            file->has_pending_record = false;
+        }
+
+        if (file->has_pending_value) {
+            file->value = file->pending_value;
+            file->has_pending_value = false;
+        }
+
+        if (file->has_pending_data) {
+            memcpy(file->data, file->pending_data, MOCK_FILE_DATA);
+            file->has_pending_data = false;
+        }
+    }
+}
+
+static void mock_abort_files(mock_card_t *mock) {
+    for (size_t i = 0; i < mock->file_count; i++) {
+        mock->files[i].has_pending_record = false;
+        mock->files[i].has_pending_value = false;
+        mock->files[i].has_pending_data = false;
+    }
+}
+
+// where a data file's writes land: a standard file takes them at once, a backup
+// file stages them for CommitTransaction
+static uint8_t *mock_write_target(mock_file_t *file) {
+    if (file->type != 0x01) {
+        return file->data;
+    }
+    if (file->has_pending_data == false) {
+        memcpy(file->pending_data, file->data, MOCK_FILE_DATA);
+        file->has_pending_data = true;
+    }
+    return file->pending_data;
 }
 
 // the answer to GetFileSettings, in the wire layout the library decodes
@@ -387,6 +475,9 @@ static int mock_secure_reply(mock_card_t *mock, uint8_t cmd, nxpsc_commmode_t co
                 if (rc != NXPSC_OK) {
                     return rc;
                 }
+                // the EV1 chain runs through the answer as well as the command,
+                // so the card keeps the IV this MAC left behind
+                memcpy(mock->secure_iv, ctx.iv, sizeof(mock->secure_iv));
                 memcpy(rx + 1 + payload_len, cmac, mac_len);
             } else {
                 uint8_t mac[8] = {0};
@@ -553,6 +644,24 @@ static bool mock_has_valid_ev2_request_mac(mock_card_t *mock, const uint8_t *tx,
 // DF name, and asks for the next with 0xAF. The name length is only knowable
 // from the frame length, so a reader that concatenates the frames first cannot
 // tell where one name ends and the next entry begins
+// The answer to a command that returns no data. Only the EV2 and LRP channels
+// MAC such an answer; on the earlier ones it is a bare status, and building it
+// through the secure path would advance a CMAC chain the library never
+// advanced for it
+static int mock_ack(mock_card_t *mock, uint8_t cmd, uint8_t *rx, size_t cap, size_t *rx_len) {
+    if (mock->secure_active && mock->secure_channel != NXPSC_CHAN_D40) {
+        int rc = mock_secure_reply(mock, cmd, NXPSC_COMM_MAC, NULL, 0, 0x00, false, rx, cap, rx_len);
+        mock_secure_advance(mock);
+        return rc;
+    }
+    if (cap < 1) {
+        return NXPSC_E_LENGTH;
+    }
+    rx[0] = 0x00;
+    *rx_len = 1;
+    return NXPSC_OK;
+}
+
 static int df_names_frame(mock_card_t *mock, uint8_t *rx, size_t cap, size_t *rx_len) {
     static const struct {
         uint8_t aid[3];
@@ -984,6 +1093,14 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                         uint8_t *rx, size_t cap, size_t *rx_len) {
     // a full frame means the library is chaining, ask for the next one
     if (mock->in_version == false && tx_len == MOCK_TX_FRAME_MAX + 1) {
+        // the mock does not reassemble a chained write, so it stops claiming to
+        // know what the file holds rather than keeping a half written copy
+        if (tx[0] == DF_WRITE_DATA || tx[0] == DF_WRITE_RECORD || tx[0] == DF_UPDATE_RECORD) {
+            mock_file_t *file = mock_find_file(mock, tx[1]);
+            if (file != NULL) {
+                file->contents_unknown = true;
+            }
+        }
         rx[0] = 0xAF;
         *rx_len = 1;
         return NXPSC_OK;
@@ -1176,18 +1293,56 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             return NXPSC_OK;
 
         case 0xBB: {                    // ReadRecords, oldest first
-            size_t want = (tx_len >= 8) ? (size_t)tx[5] : 1;
-            size_t size = 8;
-            if (want == 0 || want > 4 || cap < 1 + want * size) {
+            // FileNo || RecNo (3) || RecCount (3), the count 0 meaning all of
+            // them from RecNo on
+            const mock_file_t *file = (tx_len >= 8) ? mock_find_file(mock, tx[1]) : NULL;
+            if (file != NULL && file->contents_unknown) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0x9D, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+            if (file == NULL || (file->type != 0x03 && file->type != 0x04)) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            uint32_t first = mock_u24(tx + 2);
+            uint32_t want = mock_u24(tx + 5);
+            if (want == 0) {
+                want = (first < file->record_count) ? (uint32_t)file->record_count - first : 0;
+            }
+            if (first + want > file->record_count) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xBE, false,
+                                           rx, cap, rx_len);       // BOUNDARY_ERROR
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            size_t size = (file->record_size > MOCK_RECORD_SIZE) ? MOCK_RECORD_SIZE : file->record_size;
+            uint8_t payload[MOCK_MAX_RECORDS * MOCK_RECORD_SIZE] = {0};
+            size_t payload_len = 0;
+            // record 0 is the most recent, so walk back from the newest
+            for (uint32_t r = 0; r < want; r++) {
+                size_t index = file->record_count - 1 - first - r;
+                memcpy(payload + payload_len, file->records[index], size);
+                payload_len += size;
+            }
+
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, payload_len, 0x00,
+                                           false, rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            if (cap < payload_len + 1) {
                 return NXPSC_E_LENGTH;
             }
             rx[0] = 0x00;
-            for (size_t r = 0; r < want; r++) {
-                for (size_t i = 0; i < size; i++) {
-                    rx[1 + r * size + i] = (uint8_t)(0x10 * (r + 1) + i);
-                }
-            }
-            *rx_len = 1 + want * size;
+            memcpy(rx + 1, payload, payload_len);
+            *rx_len = payload_len + 1;
             return NXPSC_OK;
         }
 
@@ -1222,15 +1377,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                 len -= 8;
             }
             mock_note_file(mock, tx[0], tx + 1, len);
-            if (mock->secure_active) {
-                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
-                                           rx, cap, rx_len);
-                mock_secure_advance(mock);
-                return rc;
-            }
-            rx[0] = 0x00;
-            *rx_len = 1;
-            return NXPSC_OK;
+            return mock_ack(mock, tx[0], rx, cap, rx_len);
         }
 
         case 0xDF: {                    // DeleteFile
@@ -1293,47 +1440,110 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             return NXPSC_OK;
         }
 
-        case 0x6C:                      // GetValue
-            if (cap < 5) {
-                return NXPSC_E_LENGTH;
+        case 0x6C: {                    // GetValue
+            const mock_file_t *file = (tx_len >= 2) ? mock_find_file(mock, tx[1]) : NULL;
+            if (file == NULL || file->type != 0x02) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
             }
-            rx[0] = 0x00;
-            rx[1] = 0x39;
-            rx[2] = 0x30;
-            rx[3] = 0x00;
-            rx[4] = 0x00;
-            *rx_len = 5;
-            return NXPSC_OK;
 
-        case 0xBD: {                    // ReadData
-            uint32_t length = 0;
-            if (tx_len >= 8) {
-                length = (uint32_t)tx[5] | ((uint32_t)tx[6] << 8) | ((uint32_t)tx[7] << 16);
-            }
-            if (mock->read_len > 0) {
-                length = (uint32_t)mock->read_len;
-            }
-            if (length == 0 || length > 64) {
-                length = 16;
-            }
-            if (mock->secure_active && mock->read_comm != NXPSC_COMM_PLAIN) {
-                uint8_t payload[64] = {0};
-                for (uint32_t i = 0; i < length; i++) {
-                    payload[i] = (uint8_t)i;
-                }
-                int rc = mock_secure_reply(mock, tx[0], mock->read_comm, payload, length, 0x00,
-                                           false, rx, cap, rx_len);
+            // the committed value: a credit or debit in flight is not visible
+            // until CommitTransaction
+            uint8_t payload[4];
+            payload[0] = (uint8_t)(file->value & 0xFF);
+            payload[1] = (uint8_t)((file->value >> 8) & 0xFF);
+            payload[2] = (uint8_t)((file->value >> 16) & 0xFF);
+            payload[3] = (uint8_t)((file->value >> 24) & 0xFF);
+
+            if (mock->secure_active) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
+                                           0x00, false, rx, cap, rx_len);
                 mock_secure_advance(mock);
                 return rc;
             }
-            if (length > cap - 1) {
-                length = (cap > 17) ? 16 : 1;
+            if (cap < sizeof(payload) + 1) {
+                return NXPSC_E_LENGTH;
+            }
+            rx[0] = 0x00;
+            memcpy(rx + 1, payload, sizeof(payload));
+            *rx_len = sizeof(payload) + 1;
+            return NXPSC_OK;
+        }
+
+        case 0x0C:                      // Credit
+        case 0xDC:                      // Debit
+        case 0x1C: {                    // LimitedCredit
+            size_t len = tx_len - 1;
+            if (mock->secure_active && len >= 8) {
+                len -= 8;
+            }
+            mock_file_t *file = (len >= 5) ? mock_find_file(mock, tx[1]) : NULL;
+            if (file == NULL || file->type != 0x02) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            int32_t delta = (int32_t)((uint32_t)tx[2] | ((uint32_t)tx[3] << 8)
+                                      | ((uint32_t)tx[4] << 16) | ((uint32_t)tx[5] << 24));
+            if (file->has_pending_value == false) {
+                file->pending_value = file->value;
+                file->has_pending_value = true;
+            }
+            file->pending_value += (tx[0] == 0xDC) ? -delta : delta;
+
+            return mock_ack(mock, tx[0], rx, cap, rx_len);
+        }
+
+        case 0xBD: {                    // ReadData
+            // FileNo || Offset (3) || Length (3), the length 0 meaning the rest
+            // of the file
+            const mock_file_t *file = (tx_len >= 8) ? mock_find_file(mock, tx[1]) : NULL;
+            if (file != NULL && file->contents_unknown) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0x9D, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+            if (file == NULL || file->type == 0x02 || file->type == 0x03 || file->type == 0x04) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            uint32_t offset = mock_u24(tx + 2);
+            uint32_t length = mock_u24(tx + 5);
+            uint32_t size = (file->size > MOCK_FILE_DATA) ? MOCK_FILE_DATA : file->size;
+            if (length == 0) {
+                length = (offset < size) ? size - offset : 0;
+            }
+            // mock_card_t::read_len shortens the answer, for the chaining tests
+            if (mock->read_len > 0 && mock->read_len < length) {
+                length = (uint32_t)mock->read_len;
+            }
+            if (offset + length > size) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xBE, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+
+            if (mock->secure_active && mock->read_comm != NXPSC_COMM_PLAIN) {
+                int rc = mock_secure_reply(mock, tx[0], mock->read_comm, file->data + offset,
+                                           length, 0x00, false, rx, cap, rx_len);
+                mock_secure_advance(mock);
+                return rc;
+            }
+            if (cap < length + 1) {
+                return NXPSC_E_LENGTH;
             }
 
             rx[0] = 0x00;
-            for (uint32_t i = 0; i < length; i++) {
-                rx[1 + i] = (uint8_t)i;
-            }
+            memcpy(rx + 1, file->data + offset, length);
             *rx_len = length + 1;
             return NXPSC_OK;
         }
@@ -1442,37 +1652,78 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
                     file->access = mock->tm_file_access;
                 }
             }
-            if (mock->secure_active) {
-                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
-                                           rx, cap, rx_len);
-                mock_secure_advance(mock);
-                return rc;
-            }
-            rx[0] = 0x00;
-            *rx_len = 1;
-            return NXPSC_OK;
+            return mock_ack(mock, tx[0], rx, cap, rx_len);
         }
 
         case DF_WRITE_RECORD: {
-            // FileNo || Offset (3) || Length (3) || Data, and in MAC mode a
-            // trailing 8 byte command MAC the card strips before the TMI
-            size_t len = tx_len - 1;
-            if (mock->secure_active && len >= 8) {
-                len -= 8;
+            // FileNo || Offset (3) || Length (3) || Data, and the command MAC
+            // after it in MAC mode
+            size_t data_len = 0;
+            bool plain = mock_write_payload(mock, tx, tx_len, 7, &data_len);
+
+            if (mock->tm_file && plain && data_len > 0) {
+                mock_tmi_write_record(mock, tx + 1, tx + 8, data_len);
             }
-            if (mock->tm_file && len > 7) {
-                mock_tmi_write_record(mock, tx + 1, tx + 8, len - 7);
+
+            // the record itself, pending until the transaction is committed
+            mock_file_t *file = mock_find_file(mock, tx[1]);
+            if (file != NULL && data_len > 0) {
+                if (plain == false) {
+                    file->contents_unknown = true;
+                }
+                else {
+                    size_t stored = (data_len > MOCK_RECORD_SIZE) ? MOCK_RECORD_SIZE : data_len;
+                    memset(file->pending_record, 0, MOCK_RECORD_SIZE);
+                    memcpy(file->pending_record, tx + 8, stored);
+                    file->pending_len = stored;
+                    file->has_pending_record = true;
+                }
             }
-            if (mock->secure_active) {
-                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
+            return mock_ack(mock, tx[0], rx, cap, rx_len);
+        }
+
+        case 0x3D: {                    // WriteData
+            // FileNo || Offset (3) || Length (3) || Data, and a command MAC
+            // after it in MAC mode
+            size_t data_len = 0;
+            bool plain = mock_write_payload(mock, tx, tx_len, 7, &data_len);
+            mock_file_t *file = (tx_len > 8) ? mock_find_file(mock, tx[1]) : NULL;
+            if (file == NULL) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xF0, false,
                                            rx, cap, rx_len);
-                mock_secure_advance(mock);
+                mock_secure_abort(mock);
                 return rc;
             }
-            rx[0] = 0x00;
-            *rx_len = 1;
-            return NXPSC_OK;
+
+            uint32_t offset = mock_u24(tx + 2);
+            if (plain == false) {
+                // enciphered, so the mock cannot see what was written
+                file->contents_unknown = true;
+                if (mock->secure_active) {
+                    int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, NULL, 0, 0x00, false,
+                                               rx, cap, rx_len);
+                    mock_secure_advance(mock);
+                    return rc;
+                }
+                rx[0] = 0x00;
+                *rx_len = 1;
+                return NXPSC_OK;
+            }
+            if (offset + data_len > MOCK_FILE_DATA) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0xBE, false,
+                                           rx, cap, rx_len);       // BOUNDARY_ERROR
+                mock_secure_abort(mock);
+                return rc;
+            }
+            memcpy(mock_write_target(file) + offset, tx + 8, data_len);
+
+            return mock_ack(mock, tx[0], rx, cap, rx_len);
         }
+
+        case 0xA7:                      // AbortTransaction
+            mock_abort_files(mock);
+            mock->tmi_len = 0;          // the transaction MAC calculation restarts
+            break;                      // the acknowledgement follows below
 
         case DF_COMMIT_TRANSACTION: {
             // with option 0x01 the card answers TMC || TMV, and only an
@@ -1483,6 +1734,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             }
             bool wants_tmac = (len >= 1) && (tx[1] == 0x01);
             if (wants_tmac == false) {
+                mock_commit_files(mock);
                 break;                  // plain CommitTransaction, bare ack below
             }
             if (mock->tm_file == false || mock->tmi_len == 0) {
@@ -1506,6 +1758,7 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
 
             mock->tmc = tmc;
             mock->tmi_len = 0;          // a new transaction starts here
+            mock_commit_files(mock);
 
             if (mock->secure_active) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_MAC, payload, sizeof(payload),
