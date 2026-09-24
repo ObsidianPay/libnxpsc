@@ -24,6 +24,7 @@ says so.
 - [Records](#records)
 - [Files in an ISO application](#files-in-an-iso-application)
 - [Transaction MAC files](#transaction-mac-files)
+- [Statuses the mock card returns](#statuses-the-mock-card-returns)
 - [The proximity check](#the-proximity-check)
 - [SetConfiguration](#setconfiguration)
 - [NV memory is not reclaimed](#nv-memory-is-not-reclaimed)
@@ -297,6 +298,41 @@ with `0xAE` (authentication error), not `0x9D` (permission denied). The status
 names the session rather than the access right: the card is saying the key you
 are authenticated with is not the one that may do this. `0x9D` is what a file
 operation gets when the access rights refuse it.
+
+## Statuses the mock card returns
+^[Top](#top)
+
+The mock card (`tests/mockcard.c`) answers some commands with an error status.
+Each one below is either something a card has been seen to do, or a reading of
+the data sheet that no card has confirmed yet. The second kind are the mock's
+guesses, and a guess is a fixed table one level down: a test that passes against
+it proves only that the library agrees with the guess. When a hardware run
+passes through one of these paths, move the row up and say what was seen.
+
+**Seen on a card**
+
+| Status | When the mock returns it | Evidence |
+|---|---|---|
+| `0x7E` length error | an authentication frame of the wrong length | this page: a frame the card cannot parse answers `0x7E` |
+| `0x1E` integrity error | a command whose MAC does not verify | this page: a stale command counter fails the MAC |
+| `0xA0` application not found | SelectApplication of an AID the card does not hold | a personalisation run, 2026-09-21: the station read `0xA0` as "not present" |
+
+**Not yet seen on a card**
+
+| Status | When the mock returns it | Basis |
+|---|---|---|
+| `0xF0` file not found | ReadData, WriteData, ReadRecords, GetValue, Credit, Debit, LimitedCredit or GetFileSettings on a file the card does not hold | data sheet status table |
+| `0xBE` boundary error | ReadData or WriteData past the end of the file; ReadRecords asking for more records than it holds | data sheet status table |
+| `0x40` no such key | GetKeyVersion for a key the application does not have | data sheet; see the porting notes on `0x40` |
+| `0xA0` application not found | GetKeySettings with no application selected | data sheet; only SelectApplication's `0xA0` has been seen |
+| `0x9D` permission denied | CommitTransaction asking for the transaction MAC in an application with no transaction MAC file | the data sheet says only that the command is rejected |
+| `0xAE` authentication error | GetCardUID without a session | data sheet; the card has been seen to answer `0xAE` elsewhere (RollKeySet above, ChangeKey below) |
+
+**Not a card behaviour at all**
+
+| Status | When the mock returns it | Why |
+|---|---|---|
+| `0x9D` permission denied | ReadData or ReadRecords on a file whose contents the mock does not know, because a write reached it enciphered or chained across frames | A card would return the data. This is the mock declining to invent it, so there is nothing for hardware to confirm; the status only has to be an error |
 
 ## The proximity check
 ^[Top](#top)
