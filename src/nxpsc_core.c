@@ -737,7 +737,12 @@ int nxpsc_get_card_uid(nxpsc_card_t *card, uint8_t *uid, size_t cap, size_t *len
     uint8_t resp[32] = {0};
     size_t resp_len = 0;
 
-    int rc = nxpsc_exchange(card, DF_GET_CARD_UID, NULL, 0, MODE_PLAIN, MODE_ENC,
+    // on EV2 and LRP a command carries its MAC even with no data, and an EV3
+    // answers a bare 51 with 0x7E, seen on a card. the earlier channels send it
+    // bare, which is what the D40 path was verified with
+    nxpsc_mode_t tx_mode = (card->channel == NXPSC_CHAN_EV2 || card->channel == NXPSC_CHAN_LRP)
+                           ? MODE_MAC : MODE_PLAIN;
+    int rc = nxpsc_exchange(card, DF_GET_CARD_UID, NULL, 0, tx_mode, MODE_ENC,
                             resp, sizeof(resp), &resp_len);
     if (rc != NXPSC_OK) {
         return rc;

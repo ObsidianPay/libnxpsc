@@ -2043,6 +2043,58 @@ static void test_change_key_ends_session(void) {
     nxpsc_close(card);
 }
 
+// GetCardUID on an EV2 session carries its MAC. Sent bare, an EV3 answered 0x7E
+// and dropped the session, which is where Tessera's terminal first met it: the
+// mock used to accept the bare command, so nothing here noticed
+static void test_get_card_uid_ev2(void) {
+    const nxpsc_key_t key = {
+        .type = NXPSC_KEY_AES128,
+        .data = {0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+                 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F},
+    };
+    static const uint8_t rnd_b[16] = {0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+                                      0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F};
+
+    mock_card_t mock;
+    nxpsc_transport_t transport;
+    nxpsc_card_t *card = NULL;
+
+    mock_init(&mock, DESFIRE_EV2);
+    mock_transport(&mock, &transport);
+    mock.auth_key_type = NXPSC_KEY_AES128;
+    memcpy(mock.auth_key, key.data, sizeof(mock.auth_key));
+    memcpy(mock.auth_rnd_b, rnd_b, sizeof(rnd_b));
+    mock.validate_secure_requests = true;
+
+    nxpsc_set_rng(fixed_rng, NULL);
+    bool ok = (nxpsc_open(&transport, &card) == NXPSC_OK);
+    if (ok) {
+        card->type = DESFIRE_EV2;
+        card->selected_aid = 0x010203;
+        ok = (nxpsc_authenticate(card, 0, &key, NXPSC_CHAN_EV2) == NXPSC_OK);
+    }
+
+    // the library's GetCardUID: MACed, answered, decoded, and the session goes on
+    uint8_t uid[16] = {0};
+    size_t uid_len = 0;
+    ok = ok && (nxpsc_get_card_uid(card, uid, sizeof(uid), &uid_len) == NXPSC_OK);
+    ok = ok && (uid_len == 7) && (memcmp(uid, mock.uid, 7) == 0);
+    ok = ok && nxpsc_is_authenticated(card);
+    ok = ok && (nxpsc_get_card_uid(card, uid, sizeof(uid), &uid_len) == NXPSC_OK);
+
+    // the bare command is the card's length error, and ends the session
+    uint8_t resp[32] = {0};
+    size_t resp_len = 0;
+    ok = ok && (nxpsc_command(card, 0x51, NULL, 0, NXPSC_COMM_PLAIN, NXPSC_COMM_FULL,
+                              resp, sizeof(resp), &resp_len) == NXPSC_E_CARD);
+    ok = ok && (nxpsc_last_status(card) == 0x7E);
+    ok = ok && (mock.secure_active == false);
+
+    nxpsc_set_rng(NULL, NULL);
+    check("GetCardUID on an EV2 session carries its MAC", ok);
+    nxpsc_close(card);
+}
+
 // option 0x00 is one byte carrying four flags, and every call writes all of
 // them. the two flag wrapper zeroes the other two, which is the whole reason
 // the four flag form exists
@@ -2366,6 +2418,7 @@ int main(void) {
     test_secure_channel_exact_buffers();
     test_create_application_layout();
     test_legacy_get_card_uid();
+    test_get_card_uid_ev2();
     test_legacy_des_degraded_session_key();
     test_info_parsing();
     test_get_df_names_two_apps();

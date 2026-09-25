@@ -1868,6 +1868,15 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
         }
 
         case 0x51:                      // GetCardUID, only valid authenticated
+            // on EV2 and LRP the command is 51 || MAC(8). a bare 51 is a length
+            // error, as an EV3 answered it, whether or not MACs are checked
+            if (mock->secure_active && tx_len != 1 + 8 &&
+                    (mock->secure_channel == NXPSC_CHAN_EV2 || mock->secure_channel == NXPSC_CHAN_LRP)) {
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, 0x7E, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
             if (mock->secure_active) {
                 int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_FULL, mock->uid,
                                            sizeof(mock->uid), 0x00, mock->d40_ev1_style_uid,

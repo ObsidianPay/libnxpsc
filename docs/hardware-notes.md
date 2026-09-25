@@ -314,6 +314,7 @@ passes through one of these paths, move the row up and say what was seen.
 | Status | When the mock returns it | Evidence |
 |---|---|---|
 | `0x7E` length error | an authentication frame of the wrong length | this page: a frame the card cannot parse answers `0x7E` |
+| `0x7E` length error | GetCardUID on an EV2 or LRP session sent without its MAC | a Tessera terminal run, 2026-09-25: an EV3 authenticated on key 2 (EV2 channel) answered a bare `51` with `0x7E` and dropped the session. The library now sends `51 ‖ MAC`; its encrypted answer on EV2 has not been seen on a card yet |
 | `0x1E` integrity error | a command whose MAC does not verify | this page: a stale command counter fails the MAC |
 | `0xA0` application not found | SelectApplication of an AID the card does not hold | a personalisation run, 2026-09-21: the station read `0xA0` as "not present" |
 
