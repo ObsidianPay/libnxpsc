@@ -1741,13 +1741,25 @@ static int native_frame(mock_card_t *mock, const uint8_t *tx, size_t tx_len,
             size_t data_len = 0;
             bool plain = mock_write_payload(mock, tx, tx_len, 7, &data_len);
 
+            // a record needs a record file to go into. Anything else is refused,
+            // and like any error it ends the transaction on the card
+            mock_file_t *file = (tx_len > 1) ? mock_find_file(mock, tx[1]) : NULL;
+            if (file == NULL || (file->type != 0x03 && file->type != 0x04)) {
+                uint8_t status = (file == NULL) ? 0xF0 : 0x9D;     // FILE_NOT_FOUND, PERMISSION_DENIED
+                mock_abort_files(mock);
+                mock->tmi_len = 0;
+                int rc = mock_secure_reply(mock, tx[0], NXPSC_COMM_PLAIN, NULL, 0, status, false,
+                                           rx, cap, rx_len);
+                mock_secure_abort(mock);
+                return rc;
+            }
+
             if (mock->tm_file && plain && data_len > 0) {
                 mock_tmi_write_record(mock, tx + 1, tx + 8, data_len);
             }
 
             // the record itself, pending until the transaction is committed
-            mock_file_t *file = mock_find_file(mock, tx[1]);
-            if (file != NULL && data_len > 0) {
+            if (data_len > 0) {
                 if (plain == false) {
                     file->contents_unknown = true;
                 }

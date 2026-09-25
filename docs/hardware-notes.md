@@ -321,7 +321,8 @@ passes through one of these paths, move the row up and say what was seen.
 
 | Status | When the mock returns it | Basis |
 |---|---|---|
-| `0xF0` file not found | ReadData, WriteData, ReadRecords, GetValue, Credit, Debit, LimitedCredit or GetFileSettings on a file the card does not hold | data sheet status table |
+| `0xF0` file not found | ReadData, WriteData, WriteRecord, ReadRecords, GetValue, Credit, Debit, LimitedCredit or GetFileSettings on a file the card does not hold | data sheet status table |
+| `0x9D` permission denied | WriteRecord to a file that is not a record file | a guess; the data sheet does not say which status this draws |
 | `0xBE` boundary error | ReadData or WriteData past the end of the file; ReadRecords asking for more records than it holds | data sheet status table |
 | `0x40` no such key | GetKeyVersion for a key the application does not have | data sheet; see the porting notes on `0x40` |
 | `0xA0` application not found | GetKeySettings with no application selected | data sheet; only SelectApplication's `0xA0` has been seen |

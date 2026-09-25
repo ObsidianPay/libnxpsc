@@ -1538,6 +1538,14 @@ static void test_mock_answers_what_was_written(void) {
     ok = ok && (nxpsc_read_data(card, 0x02, 0, 4, NXPSC_COMM_PLAIN, back, sizeof(back), &back_len)
                 != NXPSC_OK);
 
+    // a record written to a file that is not there, or is not a record file,
+    // is refused rather than acknowledged into nowhere
+    ok = ok && (nxpsc_write_record(card, 0x07, 0, record_a, sizeof(record_a), NXPSC_COMM_PLAIN)
+                != NXPSC_OK);
+    ok = ok && (nxpsc_last_status(card) == 0xF0);
+    ok = ok && (nxpsc_write_record(card, 0x03, 0, record_a, sizeof(record_a), NXPSC_COMM_PLAIN)
+                != NXPSC_OK);
+
     check("the mock answers what was written to it", ok);
     nxpsc_close(card);
 }
@@ -1632,6 +1640,11 @@ static void test_transaction_mac(void) {
         ok = ok && (nxpsc_create_transaction_mac_file(card, 0x02, NXPSC_COMM_MAC, &access,
                                                       &tm_key, 1) == NXPSC_OK);
         ok = ok && mock.tm_file;
+
+        // and the record file the payment is written to
+        nxpsc_access_t record_access = {2, 2, 2, 0};
+        ok = ok && (nxpsc_create_record_file(card, true, 0x01, 0, NXPSC_COMM_MAC, &record_access, 32, 4)
+                    == NXPSC_OK);
 
         // one payment: a record written in MAC mode, then the commit
         ok = ok && (nxpsc_write_record(card, 0x01, 0, record, sizeof(record), NXPSC_COMM_MAC)
