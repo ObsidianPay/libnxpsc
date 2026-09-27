@@ -297,7 +297,26 @@ application's key settings put key changes behind the master key, is refused
 with `0xAE` (authentication error), not `0x9D` (permission denied). The status
 names the session rather than the access right: the card is saying the key you
 are authenticated with is not the one that may do this. `0x9D` is what a file
-operation gets when the access rights refuse it.
+operation gets when the access rights refuse it and a session is open; with no
+session at all, the same refusal is `0xAE` (below).
+
+**A transaction MAC needs no session.** In an application holding a TMAC file,
+a cyclic record file with free write access (`0x0E`, which makes the file's
+communication mode plain) takes a plain `WriteRecord` with no authentication at
+all, and `CommitTransaction` with option `0x01` then returns TMC ‖ TMV, still with
+no session. The TMV verifies with `nxpsc_tmac_compute` over the TMI from
+`nxpsc_tmac_tmi_write_record`: nothing in the TMV's session key
+(`SV1 = 5A 00 01 00 80 ‖ TMC ‖ UID`) depends on an authenticated session, and the
+card agrees. The counter moves once per commit (seen: 1, then 2). Both calls work
+through the library as it is; nothing is session-only on the host side either.
+Seen on 2026-09-27, file created Plain with access R `2` W `E` RW `2` C `0`, TMAC
+file with ReadWrite `0x0F`.
+
+**Without a session, a keyed write is `0xAE`.** In the same application, a plain
+`WriteRecord` with no session to a record file whose write access is a key
+(`0x02`, communication mode MAC) is refused with `0xAE` (authentication error),
+not `0x9D`. As with `ChangeKey` above, the status describes the missing session
+rather than the access right.
 
 ## Statuses the mock card returns
 ^[Top](#top)
