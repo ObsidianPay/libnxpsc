@@ -3,7 +3,7 @@
 [![libnxpsc](https://github.com/ObsidianPay/libnxpsc/actions/workflows/libnxpsc.yml/badge.svg)](https://github.com/ObsidianPay/libnxpsc/actions/workflows/libnxpsc.yml)
 
 A portable, backend agnostic C library for low level programming of NXP
-smartcards. 
+and MIFARE smartcards. 
 
 [[card support]](#by-card-family)
 
