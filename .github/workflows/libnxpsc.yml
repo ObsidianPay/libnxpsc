@@ -28,7 +28,13 @@ jobs:
           if [ "${{ matrix.cc }}" = "msvc" ]; then
             cmake -S . -B build
           else
-            CC=${{ matrix.cc }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            extra=""
+            # macOS arm64 runners build a universal (arm64 + x86_64) library, so
+            # osx-x64 is covered without the soon-to-be-retired Intel images
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              extra="-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+            fi
+            CC=${{ matrix.cc }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${extra:+"$extra"}
           fi
 
       - name: Build
@@ -37,6 +43,21 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure -C Release
+
+      # ctest is arm64 only, so run the test executables directly under
+      # arch -x86_64 (Rosetta 2)
+      - name: Test the x86_64 slice
+        if: runner.os == 'macOS'
+        working-directory: build
+        run: |
+          softwareupdate --install-rosetta --agree-to-license || true
+          lipo -archs "$(find . -name 'libnxpsc*.dylib' | head -n 1)" | grep -q arm64
+          lipo -archs "$(find . -name 'libnxpsc*.dylib' | head -n 1)" | grep -q x86_64
+          for t in nxpsc_test_crypto nxpsc_test_protocol; do
+            exe="$(find . -type f -name "$t" | head -n 1)"
+            lipo -archs "$exe" | grep -q x86_64
+            arch -x86_64 "$exe"
+          done
 
       # the installed layout is the distribution: bin/ (DLLs), lib/ (static and
       # import libraries, shared objects), include/nxpsc/nxpsc.h
