@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.os }} / ${{ matrix.cc }}
+    name: ${{ matrix.os }} / ${{ matrix.cc }} / ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -15,9 +15,19 @@ jobs:
         # ubuntu-24.04-arm is Linux on aarch64 (the Docker/Kubernetes arm64 case)
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         cc: [gcc, clang]
+        arch: [native]
         include:
           - os: windows-latest
             cc: msvc
+            arch: native
+          # osx-x64: cross compiled on the arm64 runner (the Intel images are
+          # being retired). the x86_64 binaries run under Rosetta 2
+          - os: macos-latest
+            cc: gcc
+            arch: x86_64
+          - os: macos-latest
+            cc: clang
+            arch: x86_64
 
     steps:
       - uses: actions/checkout@v7
@@ -28,11 +38,19 @@ jobs:
           if [ "${{ matrix.cc }}" = "msvc" ]; then
             cmake -S . -B build
           else
-            CC=${{ matrix.cc }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            extra=""
+            if [ "${{ matrix.arch }}" != "native" ]; then
+              extra="-DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}"
+            fi
+            CC=${{ matrix.cc }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $extra
           fi
 
       - name: Build
         run: cmake --build build --config Release
+
+      - name: Verify the target architecture
+        if: matrix.arch != 'native'
+        run: lipo -archs "$(find build -name 'libnxpsc*.dylib' | head -n 1)" | grep -qx "${{ matrix.arch }}"
 
       - name: Test
         working-directory: build
@@ -69,7 +87,7 @@ jobs:
       - name: Upload distribution
         uses: actions/upload-artifact@v7
         with:
-          name: libnxpsc-dist-${{ matrix.os }}-${{ matrix.cc }}
+          name: libnxpsc-dist-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.arch }}
           path: dist/
           if-no-files-found: error
 
@@ -77,7 +95,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: libnxpsc-${{ matrix.os }}-${{ matrix.cc }}
+          name: libnxpsc-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.arch }}
           path: |
             build/**/*.a
             build/**/*.so
@@ -91,7 +109,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: test-logs-${{ matrix.os }}-${{ matrix.cc }}
+          name: test-logs-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.arch }}
           path: build/Testing/
           if-no-files-found: ignore
 
