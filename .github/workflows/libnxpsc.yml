@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.os }} / ${{ matrix.cc }} / ${{ matrix.arch }}
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -15,19 +15,9 @@ jobs:
         # ubuntu-24.04-arm is Linux on aarch64 (the Docker/Kubernetes arm64 case)
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
         cc: [gcc, clang]
-        arch: [native]
         include:
           - os: windows-latest
             cc: msvc
-            arch: native
-          # osx-x64: cross compiled on the arm64 runner (the Intel images are
-          # being retired). the x86_64 binaries run under Rosetta 2
-          - os: macos-latest
-            cc: gcc
-            arch: x86_64
-          - os: macos-latest
-            cc: clang
-            arch: x86_64
 
     steps:
       - uses: actions/checkout@v7
@@ -39,22 +29,29 @@ jobs:
             cmake -S . -B build
           else
             extra=""
-            if [ "${{ matrix.arch }}" != "native" ]; then
-              extra="-DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}"
+            # macOS arm64 runners build a universal (arm64 + x86_64) library, so
+            # osx-x64 is covered without the soon-to-be-retired Intel images
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              extra="-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
             fi
-            CC=${{ matrix.cc }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $extra
+            CC=${{ matrix.cc }} cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${extra:+"$extra"}
           fi
 
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Verify the target architecture
-        if: matrix.arch != 'native'
-        run: lipo -archs "$(find build -name 'libnxpsc*.dylib' | head -n 1)" | grep -qx "${{ matrix.arch }}"
-
       - name: Test
         working-directory: build
         run: ctest --output-on-failure -C Release
+
+      # the x86_64 slice runs under Rosetta 2
+      - name: Test the x86_64 slice
+        if: runner.os == 'macOS'
+        working-directory: build
+        run: |
+          lipo -archs "$(find . -name 'libnxpsc*.dylib' | head -n 1)" | grep -q arm64
+          lipo -archs "$(find . -name 'libnxpsc*.dylib' | head -n 1)" | grep -q x86_64
+          arch -x86_64 ctest --output-on-failure -C Release
 
       # the installed layout is the distribution: bin/ (DLLs), lib/ (static and
       # import libraries, shared objects), include/nxpsc/nxpsc.h
@@ -87,7 +84,7 @@ jobs:
       - name: Upload distribution
         uses: actions/upload-artifact@v7
         with:
-          name: libnxpsc-dist-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.arch }}
+          name: libnxpsc-dist-${{ matrix.os }}-${{ matrix.cc }}
           path: dist/
           if-no-files-found: error
 
@@ -95,7 +92,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: libnxpsc-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.arch }}
+          name: libnxpsc-${{ matrix.os }}-${{ matrix.cc }}
           path: |
             build/**/*.a
             build/**/*.so
@@ -109,7 +106,7 @@ jobs:
         uses: actions/upload-artifact@v7
         if: failure()
         with:
-          name: test-logs-${{ matrix.os }}-${{ matrix.cc }}-${{ matrix.arch }}
+          name: test-logs-${{ matrix.os }}-${{ matrix.cc }}
           path: build/Testing/
           if-no-files-found: ignore
 
