@@ -44,14 +44,15 @@ jobs:
         working-directory: build
         run: ctest --output-on-failure -C Release
 
-      # the x86_64 slice runs under Rosetta 2
+      # ctest is arm64 only, so launch each test under arch -x86_64 (Rosetta 2)
       - name: Test the x86_64 slice
         if: runner.os == 'macOS'
         working-directory: build
         run: |
+          softwareupdate --install-rosetta --agree-to-license || true
           lipo -archs "$(find . -name 'libnxpsc*.dylib' | head -n 1)" | grep -q arm64
           lipo -archs "$(find . -name 'libnxpsc*.dylib' | head -n 1)" | grep -q x86_64
-          arch -x86_64 ctest --output-on-failure -C Release
+          ctest --test-launcher "arch -x86_64" --output-on-failure -C Release
 
       # the installed layout is the distribution: bin/ (DLLs), lib/ (static and
       # import libraries, shared objects), include/nxpsc/nxpsc.h
